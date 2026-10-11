@@ -2,6 +2,7 @@
 name = "phonefarm"
 version = "0.2.0"
 edition = "2021"
+rust-version = "1.89"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -13,6 +14,7 @@ flate2 = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 regex = "1"
 sha2 = "0.10"
+libc = "0.2"
 
 [profile.release]
 strip = true
