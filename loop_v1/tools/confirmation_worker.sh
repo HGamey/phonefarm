@@ -7,7 +7,31 @@ case "$TOKEN:$RUN" in *[!a-zA-Z0-9_:-]*) exit 70 ;; esac
 [ "$(cat "$D/owner")" = "$TOKEN $BOOT" ] || exit 71
 [ "$(cat /proc/sys/kernel/random/boot_id)" = "$BOOT" ] || exit 72
 [ ! -e "$D/session.closed" ] || exit 86
+# A capability diagnostic session cannot enter any performance sampling mode.
+if [ -e "$D/thermal-purpose.txt" ]; then
+  [ -f "$D/thermal-purpose.txt" ] && [ "$(cat "$D/thermal-purpose.txt")" = capability_absolute_v1 ] || exit 87
+  case "$MODE" in control_probe|reconcile_controls) ;; *) exit 87 ;; esac
+fi
 R="$D/$RUN"
+#phonefarm_thermal_clock_begin
+thermal_uptime() {
+  v=$(cut -d' ' -f1 /proc/uptime) || return 1
+  awk -v v="$v" 'BEGIN {if (v !~ /^[0-9]+([.][0-9]+)?$/) exit 1; print v}'
+}
+thermal_deadline() {
+  awk -v a="$1" -v d="$2" 'BEGIN {if (a !~ /^[0-9]+([.][0-9]+)?$/ || d !~ /^[0-9]+([.][0-9]+)?$/) exit 1; printf "%.6f\n", a+d}'
+}
+thermal_point_uptime() {
+  printf '%s\n' "$1" | awk -F '\t' '$1=="UPTIME" {n++; v=$2} END {if (n!=1 || v !~ /^[0-9]+([.][0-9]+)?$/) exit 1; print v}'
+}
+thermal_wait_until() {
+  desired=$1; latest=$2; previous=$3; current=$(thermal_uptime) || return 1
+  delay=$(awk -v a="$current" -v d="$desired" -v l="$latest" -v p="$previous" 'BEGIN {if (a !~ /^[0-9]+([.][0-9]+)?$/ || d !~ /^[0-9]+([.][0-9]+)?$/ || l !~ /^[0-9]+([.][0-9]+)?$/ || p !~ /^[0-9]+([.][0-9]+)?$/ || p>d || d>l || a<p || a>l) exit 1; if (d>a) printf "%.6f\n", d-a+0.02; else print 0}') || return 1
+  [ "$delay" = 0 ] || sleep "$delay" || return 1
+  current=$(thermal_uptime) || return 1
+  awk -v a="$current" -v d="$desired" -v l="$latest" 'BEGIN {exit !(a>=d && a<=l)}'
+}
+#phonefarm_thermal_clock_end
 intent() {
   [ ! -e "$D/session.closed" ] || exit 86
   [ "$(cat "$D/owner")" = "$TOKEN $BOOT" ] || exit 71
@@ -151,12 +175,12 @@ children_valid() {
   CHILD_ROWS=0
   [ -e "$R/children.tsv" ] || [ -L "$R/children.tsv" ] || return 0
   ledger_complete "$R/children.tsv" || return 1
-  CHILD_ROWS=$(awk -F '\t' -v w="$D/workload.sh" -v s="$D/sample_env.sh" '
-    NF!=4 || ($1!="workload" && $1!="sampler") || $2!~/^[0-9]+$/ ||
+  CHILD_ROWS=$(awk -F '\t' -v w="$D/workload.sh" -v s="$D/sample_env.sh" -v th="$D/thermal_sampler.sh" '
+    NF!=4 || ($1!="workload" && $1!="sampler" && $1!="thermal_sampler") || $2!~/^[0-9]+$/ ||
     $2+0<=0 || $2+0>2147483647 || $3!~/^[0-9]+$/ || $3+0<=0 ||
-    ($1=="workload" && $4!=w) || ($1=="sampler" && $4!=s) {bad=1}
+    ($1=="workload" && $4!=w) || ($1=="sampler" && $4!=s) || ($1=="thermal_sampler" && $4!=th) {bad=1}
     ++tags[$1]>1 || ++pids[$2]>1 {bad=1}
-    END {if (bad || NR<1 || NR>2) exit 1; print NR}' "$R/children.tsv") || return 1
+    END {if (bad || NR<1 || NR>3) exit 1; print NR}' "$R/children.tsv") || return 1
 }
 pending_known() {
   children_valid || return 1
@@ -165,7 +189,7 @@ pending_known() {
     ledger_complete "$pending" || return 1
     [ -f "$R/children.tsv" ] || return 1
     expected=${pending##*/}; expected=${expected#launch-}; expected=${expected%.pending}
-    case "$expected" in workload) script_expected="$D/workload.sh" ;; sampler) script_expected="$D/sample_env.sh" ;; *) return 1 ;; esac
+    case "$expected" in workload) script_expected="$D/workload.sh" ;; sampler) script_expected="$D/sample_env.sh" ;; thermal_sampler) script_expected="$D/thermal_sampler.sh" ;; *) return 1 ;; esac
     awk -F '\t' -v t="$expected" -v s="$script_expected" '
       NF!=2 || $1!=t || $2!=s {bad=1} END {exit (bad || NR!=1)}' "$pending" || return 1
     consumed_pending=0
@@ -246,13 +270,15 @@ capture() {
 cleanup_failure() {
   trap - EXIT INT TERM
   # The absence of an attributable child/group is required before any restore write.
-  if stop_owned; then restore_trace && restore_controls || true; fi
+  if stop_owned; then
+    case "$MODE" in control_probe|reconcile_controls) restore_controls || true ;; *) restore_trace && restore_controls || true ;; esac
+  fi
 }
 acquire_master() {
   [ ! -e "$D/session.closed" ] || return 1
   L="$D/worker.lock"
   if [ -d "$L" ]; then
-    [ "$MODE" = reconcile ] || return 1
+    case "$MODE" in reconcile|reconcile_controls) ;; *) return 1 ;; esac
     ledger_complete "$L/owner" || return 1
     awk -v t="$TOKEN" -v b="$BOOT" 'NF!=5 || $1!=t || $2!=b {bad=1} END {exit (bad || NR!=1)}' "$L/owner" || return 1
     IFS=' ' read -r oldtoken oldboot oldpid oldticks oldrun < "$L/owner" || return 1
@@ -278,7 +304,8 @@ release_master() {
   [ "$(cat "$D/worker.lock/owner")" = "$MASTER" ] || return 1
   if [ -e "$D/session.closed" ]; then
     # Closure forbids all normal intents. Only this matching terminal reconcile may unlock.
-    [ "$MODE" = reconcile ] && [ "$(cat "$D/session.closed/owner")" = "$TOKEN $BOOT $RUN" ] || return 1
+    case "$MODE" in reconcile|reconcile_controls) ;; *) return 1 ;; esac
+    [ "$(cat "$D/session.closed/owner")" = "$TOKEN $BOOT $RUN" ] || return 1
     [ "$(cat "$D/owner")" = "$TOKEN $BOOT" ] && [ "$(cat /proc/sys/kernel/random/boot_id)" = "$BOOT" ] || return 1
     printf '%s\tterminal_release_master\t%s\t%s\n' "$TOKEN" "$D/worker.lock" "$$" >> "$D/journal.tsv"
     sync || return 1
@@ -301,16 +328,35 @@ close_session() {
 # The host invokes this worker through setsid, so master and its synchronous children own one group.
 acquire_master || exit 85
 case "$MODE" in
-  probe)
+  probe|control_probe)
     intent mkdir "$R" ''; mkdir "$R"
     trap 'cleanup_failure' EXIT INT TERM
     snapshot snapshot_before
+    if [ -f "$D/thermal_sample.sh" ]; then
+      if thermal_point=$(sh "$D/thermal_sample.sh"); then :; else thermal_code=$?; printf '%s\n' "$thermal_point" >> "$R/thermal_hold.raw.tsv"; exit "$thermal_code"; fi
+      printf '%s\n' "$thermal_point" >> "$R/thermal_hold.raw.tsv"
+      thermal_previous=$(thermal_point_uptime "$thermal_point") || exit 81
+    fi
     apply_plan "$D/$RUN.plan.tsv"
-    sleep 1
+    if [ -f "$D/thermal_sample.sh" ]; then thermal_hold_start=$(thermal_uptime) || exit 81; fi
+    [ "$MODE" != control_probe ] || snapshot snapshot_at_run
+    if [ -f "$D/thermal_sample.sh" ]; then
+      thermal_wait_until "$(thermal_deadline "$thermal_hold_start" 1)" "$(thermal_deadline "$thermal_previous" 6)" "$thermal_previous" || exit 81
+    else sleep 1; fi
     while IFS="$(printf '\t')" read -r key kind path value; do
       [ "$(read_value "$kind" "$path")" = "$value" ] || exit 74
     done < "$D/$RUN.plan.tsv"
-    sleep 10
+    if [ -f "$D/thermal_sample.sh" ]; then
+      if thermal_point=$(sh "$D/thermal_sample.sh"); then :; else thermal_code=$?; printf '%s\n' "$thermal_point" >> "$R/thermal_hold.raw.tsv"; exit "$thermal_code"; fi
+      printf '%s\n' "$thermal_point" >> "$R/thermal_hold.raw.tsv"
+      thermal_previous=$(thermal_point_uptime "$thermal_point") || exit 81
+      for thermal_offset in 6 11; do
+        thermal_wait_until "$(thermal_deadline "$thermal_hold_start" "$thermal_offset")" "$(thermal_deadline "$thermal_previous" 6)" "$thermal_previous" || exit 81
+        if thermal_point=$(sh "$D/thermal_sample.sh"); then :; else thermal_code=$?; printf '%s\n' "$thermal_point" >> "$R/thermal_hold.raw.tsv"; exit "$thermal_code"; fi
+        printf '%s\n' "$thermal_point" >> "$R/thermal_hold.raw.tsv"
+        thermal_previous=$(thermal_point_uptime "$thermal_point") || exit 81
+      done
+    else sleep 10; fi
     while IFS="$(printf '\t')" read -r key kind path value; do
       [ "$(read_value "$kind" "$path")" = "$value" ] || exit 75
       printf '%s.writable=yes\n%s.effect=live\n' "$key" "$key" >> "$R/probe_receipt.txt"
@@ -319,7 +365,14 @@ case "$MODE" in
         printf 'setting.system.refresh_rate_mode.mode%s_fps=%s (readback=%s)\n' "$value" "$fps" "$(read_value "$kind" "$path")" >> "$R/probe_receipt.txt"
       fi
     done < "$D/$RUN.plan.tsv"
-    restore_controls; restore_trace; snapshot snapshot_restored
+    [ "$MODE" != control_probe ] || snapshot snapshot_after_run
+    if [ -f "$D/thermal-purpose.txt" ]; then
+      thermal_hold_end=$(thermal_uptime) || exit 81
+      printf '#phonefarm_control_hold_complete start=%s end=%s samples=4 profile=capability_absolute_v1\n' "$thermal_hold_start" "$thermal_hold_end" >> "$R/thermal_hold.raw.tsv"
+    fi
+    restore_controls
+    [ "$MODE" = control_probe ] || restore_trace
+    snapshot snapshot_restored
     while IFS="$(printf '\t')" read -r key kind path value; do printf '%s.effect_restored=yes\n' "$key" >> "$R/probe_receipt.txt"; done < "$D/$RUN.plan.tsv"
     trap - EXIT INT TERM
     release_master
@@ -333,12 +386,25 @@ case "$MODE" in
     snapshot snapshot_before
     [ "$role" = baseline ] || apply_plan "$D/candidate.plan.tsv"
     snapshot snapshot_at_run
+    thermal_pid=''
+    if [ -f "$D/thermal_sampler.sh" ]; then
+      start_child thermal_sampler "$D/thermal_sampler.sh" "$((envdur+3))" 1 "$R/thermal.ready"; thermal_pid=$CHILD_PID
+      ready_wait=0
+      while [ ! -s "$R/thermal.ready" ]; do
+        [ "$ready_wait" -lt 100 ] || exit 81
+        kill -0 "$thermal_pid" || exit 81
+        ready_wait=$((ready_wait+1)); sleep .1
+      done
+    fi
     start_child workload "$D/workload.sh"; workload_pid=$CHILD_PID
     start_child sampler "$D/sample_env.sh" "$envdur" 1; sampler_pid=$CHILD_PID
     sleep "$lead"
     if capture "$dur" > "$R/capture.log" 2> "$R/capture.stderr"; then echo 0 > "$R/capture_exit.txt"; else code=$?; echo "$code" > "$R/capture_exit.txt"; exit "$code"; fi
     if wait "$workload_pid"; then echo 0 > "$R/workload_exit.txt"; else code=$?; echo "$code" > "$R/workload_exit.txt"; exit "$code"; fi
     if wait "$sampler_pid"; then echo 0 > "$R/sampler_exit.txt"; else code=$?; echo "$code" > "$R/sampler_exit.txt"; exit "$code"; fi
+    if [ -n "$thermal_pid" ]; then
+      if wait "$thermal_pid"; then echo 0 > "$R/thermal_sampler_exit.txt"; else code=$?; echo "$code" > "$R/thermal_sampler_exit.txt"; exit "$code"; fi
+    fi
     quiescent || exit 76
     echo OWNED_GROUPS_ABSENT > "$R/quiescence.txt"
     restore_trace; snapshot snapshot_after_run
@@ -348,14 +414,15 @@ case "$MODE" in
     release_master
     echo SAMPLE_COMPLETE
     ;;
-  reconcile)
+  reconcile|reconcile_controls)
     # Every old run owns a separate process ledger. Unknown identities are never killed.
     for prior in "$D"/*; do
       [ -d "$prior" ] || continue
       [ "$prior" != "$D/worker.lock" ] || continue
       R=$prior; stop_owned || exit 77
     done
-    restore_trace; restore_controls
+    [ "$MODE" = reconcile_controls ] || restore_trace
+    restore_controls
     R="$D/$RUN"; intent mkdir "$R" ''; mkdir "$R"; snapshot snapshot_restored
     echo 0 > "$R/restore_exit.txt"
     echo OWNED_GROUPS_ABSENT > "$R/quiescence.txt"

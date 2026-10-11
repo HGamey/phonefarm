@@ -271,3 +271,81 @@ concurrent device probe's `_cmd.out`. Failure to reserve a directory is unknown
 capability and cannot authorize writes. Fake CLI tests isolate both lease roots
 and explicitly verify that a nonroot probe cannot consume a concurrent root
 probe's output; this is host result isolation, not acquisition attestation.
+
+
+## Versioned loaded temperature sampling
+
+Optional `temperature_profile_id` defaults to legacy_cold_v1. Choosing
+loaded_steady_v1 freezes receiver rules and sensor/HAL metadata before a
+baseline-only warmup of at least 30 seconds. It emits conditions/run schema @2,
+Policy version 2 and an immutable thermal contract, without changing historical
+@1 40C/70C qualification. Limits never come from the candidate or caller.
+
+One pre-arm typed receipt and a separate owned thermal sampler cover each
+entire ENV/capture window. The third process group is governed by the same
+persistent pending/PID/start/group/permit ledger as workload and ENV; unknown
+ownership prevents restoring controls. The thermal sampler begins before ENV,
+waits for a complete first reading, and samples until ENV duration + 3 seconds;
+its terminal duration/interval/clock/count marker and exit0 are required. Read
+failures, severe/unknown HAL state, missing sensor identity, warmup or reference
+drift block the experiment. No thermal/fan/trip controls are written.
+
+Typed thermal admission/window gates replace the v1 cold gate only for @2;
+all other raw/control/restore/power/trace/independent-window requirements remain.
+The output observation/sample-qualification schemas are @2. See
+[SPEC_THERMAL_PROFILE](SPEC_THERMAL_PROFILE.md) and
+[SPEC_LOADED_OBSERVATION](SPEC_LOADED_OBSERVATION.md) for wire and reconstruction.
+These gates validate reported measurements, not remote hardware attestation,
+true display frames or sustained requested GPU frequency.
+
+
+## Explicit frame-only rendering goal
+
+Request `goal` is optional and defaults to render_efficiency (three metrics,
+verified battery window required). Explicit render_cadence freezes a new
+receiver policy and exactly two rules: frame_p95_ms lower by at least 1%, and
+fps_mean no more than 1% regression, alpha .05 and at least five AB/BA pairs.
+Power raw artifacts/status/current/voltage remain diagnostic; unverified power
+is null and no energy improvement is claimed. GPU submit cadence is a proxy,
+not display smoothness. display_smoothness is rejected. Unknown/charging power
+never silently switches the requested goal; a caller must explicitly request
+and freeze a separate render_cadence experiment before its measurements.
+
+Loaded initial control ownership is acquired after the receiver-only warmup:
+freeze temperature rules and metadata, collect the baseline-only stable warmup,
+then read the complete initial snapshot and construct the sibling restore graph.
+All steps hold the same lease and precede installation or control writes. No
+post-write snapshot can replace the frozen restore target. Later full snapshot
+equality, conditions freeze, raw chronology and restoration gates stay strict.
+
+Every loaded prepare probe revalidates a fresh typed snapshot against the frozen
+profile and warmup reference immediately before invoking its worker. The worker
+also runs the exact frozen `thermal_sample.sh` before each probe apply, including
+ordinary prepare probes, and at the readback hold boundaries. Failed or unknown
+checks precede control writes or trigger owned cleanup; earlier warmup and later
+baseline rejection do not substitute for this per-write admission. Raw probe
+thermal receipts remain capability evidence, not performance samples.
+
+Loaded prepared manifests require each `pre-probe_N-thermal.raw.tsv` and
+`pre-probe_N-thermal.json` receipt explicitly, in addition to the original probe
+and admission artifacts. Resuming collect rejects missing or extra prepared
+keys; a caller cannot drop these newly required control-admission receipts.
+
+Thermal collection schedules sample starts using device uptime deadlines. Warmup
+targets five seconds between starts; the query duration is subtracted from the
+remaining wait rather than followed by another five-second sleep. The frozen
+30-second, at-least-six-reading, <=6-second-gap and <=3C-span rules remain
+unchanged. A slow query, unknown/backward clock or missed six-second deadline
+blocks admission; cooling drift is independently rejected.
+
+The same owned worker clock helper schedules loaded probe checks and the typed
+window sampler. A probe waits through eleven seconds after apply before its
+final readback; checks retain their frozen temperature/reference requirements.
+Window collection targets one second between starts, may overrun that nominal
+target while a query is active, and still rejects a gap beyond six seconds. It
+never emits fabricated timestamps or catches up by reusing a sample. Host tests
+with an actual delayed sample body validate scheduling only, not Android clocks,
+thermal HAL latency, device quiescence or control restoration.
+
+A failed thermal point retains its partial raw stdout with the original nonzero
+exit code; it cannot emit a completion marker or become an admitted reading.

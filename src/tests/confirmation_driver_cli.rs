@@ -254,9 +254,28 @@ impl F {
             .collect::<Vec<_>>()
             .join(",");
         let metrics=p["metrics"].as_array().unwrap().iter().map(|m|format!("{{\"name\":{},\"direction\":{},\"scale\":{},\"minimum_improvement\":{},\"maximum_regression\":{}}}",m["name"],m["direction"],m["scale"],m["minimum_improvement"],m["maximum_regression"])).collect::<Vec<_>>().join(",");
-        let plantext = plantext
+        let mut plantext = plantext
             .replace(&p["schedule"].to_string(), &format!("[{schedule}]"))
             .replace(&p["metrics"].to_string(), &format!("[{metrics}]"));
+        if let Some(tc) = p.get("temperature_contract") {
+            let names = [
+                "profile_id",
+                "receiver_policy_version",
+                "profile_sha256",
+                "reference_sha256",
+                "thermal_contract_sha256",
+            ];
+            let text = format!(
+                "{{{}}}",
+                names
+                    .iter()
+                    .map(|n| format!("{}:{}", serde_json::to_string(n).unwrap(), tc[*n]))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            plantext.pop();
+            plantext += &format!(",\"temperature_contract\":{text}}}");
+        }
         let hash = sha(format!(
             "[\"game_opt_loop/confirmation_plan@1\",{},{}]",
             serde_json::to_string(&registered).unwrap(),
@@ -640,5 +659,703 @@ fn per_device_lease_excludes_other_cwd_renews_and_releases_completed_command() {
     }
     assert!(!f.dir.join("legacy/devlock.d").exists());
     assert!(competing().status.success());
+    assert!(!f.dir.join("legacy/devlock.d").exists());
+}
+
+fn control_request(f: &F, transport_kind: &str) {
+    f.write(
+        "control-request.json",
+        &json!({"schema":"phonefarm/control_probe_request@1",
+        "transport":{"kind":transport_kind,"program":f.dir.join("fake-adb"),"target":"fake-target"},
+        "candidate":f.dir.join("candidate.json")}),
+    );
+}
+#[test]
+fn capability_only_endpoint_has_no_game_inputs_no_sampling_and_closes_fake_session() {
+    let f = F::new(false);
+    control_request(&f, "fake");
+    let (code, v) = f.call(
+        &[
+            "probe-controls",
+            "--request",
+            "control-request.json",
+            "--out",
+            "control-session",
+        ],
+        "",
+    );
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["status"], "SIMULATED_CONTROL_RESTORED");
+    assert_eq!(v["evidence_origin"], "synthetic");
+    for key in [
+        "eligible",
+        "experiment_eligible",
+        "real_game_optimization_proven",
+        "promotion_allowed",
+        "actual_clock_sustained_proven",
+        "power_window_verified",
+    ] {
+        assert_eq!(v[key], false, "{key}");
+    }
+    for n in [
+        "plan.json",
+        "baseline.json",
+        "samples.json",
+        "workload.json",
+        "conditions.json",
+    ] {
+        assert!(!f.dir.join("control-session").join(n).exists(), "{n}");
+    }
+    let argv = std::fs::read_to_string(f.dir.join("argv.jsonl")).unwrap();
+    assert!(!argv.contains("dumpsys activity activities"));
+    assert!(!argv.contains(" sample "));
+    assert!(argv.contains("control_probe"));
+    assert!(argv.contains("reconcile_controls"));
+    assert!(!f.dir.join("legacy/devlock.d").exists());
+    let (code, _) = f.call(
+        &[
+            "collect",
+            "--session",
+            "control-session",
+            "--frozen",
+            "missing.json",
+        ],
+        "",
+    );
+    assert_eq!(code, 1); // Capability sessions cannot be upgraded into confirmation collection.
+}
+#[test]
+fn capability_adb_without_execute_and_extra_game_fields_do_not_call_transport() {
+    let f = F::new(false);
+    control_request(&f, "adb");
+    let (code, v) = f.call(
+        &[
+            "probe-controls",
+            "--request",
+            "control-request.json",
+            "--out",
+            "never-created",
+        ],
+        "",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(v["status"], "VALIDATED_ONLY");
+    assert!(!f.dir.join("never-created").exists());
+    assert!(!f.dir.join("argv.jsonl").exists());
+    let mut req = f.read("control-request.json");
+    req["package"] = json!("com.android.launcher");
+    f.write("control-request.json", &req);
+    let (code, _) = f.call(
+        &[
+            "probe-controls",
+            "--request",
+            "control-request.json",
+            "--out",
+            "never-created",
+            "--execute",
+        ],
+        "",
+    );
+    assert_eq!(code, 1);
+    assert!(!f.dir.join("argv.jsonl").exists());
+}
+#[test]
+fn capability_root_hot_gate_precedes_install_and_failure_keeps_recovery() {
+    for failure in ["root", "cold", "probe", "restore", "closure_unknown"] {
+        let f = F::new(false);
+        control_request(&f, "fake");
+        let (code, v) = f.call(
+            &[
+                "probe-controls",
+                "--request",
+                "control-request.json",
+                "--out",
+                "control-session",
+            ],
+            failure,
+        );
+        assert_eq!(code, 1, "{failure}: {v}");
+        assert_eq!(v["eligible"], false);
+        let argv = std::fs::read_to_string(f.dir.join("argv.jsonl")).unwrap();
+        if failure == "root" || failure == "cold" {
+            assert!(!argv.contains("mkdir /data/local/tmp"));
+            assert!(!f.dir.join("legacy/devlock.d").exists());
+        } else {
+            assert!(f.dir.join("legacy/devlock.d/phonefarm-lease.json").exists());
+            let marker: Value = serde_json::from_slice(
+                &std::fs::read(f.dir.join("legacy/devlock.d/phonefarm-lease.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(marker["recovery_required"], true);
+            if failure == "probe" {
+                let (code, v) = f.call(
+                    &["reconcile", "--session", "control-session", "--execute"],
+                    "",
+                );
+                assert_eq!(code, 0, "{v}");
+                assert_eq!(v["status"], "SIMULATED_RECONCILED");
+                assert!(!f.dir.join("legacy/devlock.d").exists());
+            }
+        }
+    }
+}
+#[test]
+fn capability_missing_frozen_tool_cannot_reconcile_or_release_barrier() {
+    let f = F::new(false);
+    control_request(&f, "fake");
+    assert_eq!(
+        f.call(
+            &[
+                "probe-controls",
+                "--request",
+                "control-request.json",
+                "--out",
+                "control-session"
+            ],
+            "probe"
+        )
+        .0,
+        1
+    );
+    let manifest_path = f.dir.join("control-session/inputs.manifest.json");
+    let mut manifest: Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["hashes"]
+        .as_object_mut()
+        .unwrap()
+        .remove("worker.sh");
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    let before = std::fs::read(f.dir.join("legacy/devlock.d/phonefarm-lease.json")).unwrap();
+    let (code, v) = f.call(
+        &["reconcile", "--session", "control-session", "--execute"],
+        "",
+    );
+    assert_eq!(code, 1, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("manifest"));
+    assert_eq!(
+        std::fs::read(f.dir.join("legacy/devlock.d/phonefarm-lease.json")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn loaded_capability_uses_typed_warmup_at_80c_still_never_experiment_qualified() {
+    let f = F::new(false);
+    control_request(&f, "fake");
+    let mut req = f.read("control-request.json");
+    req["temperature_profile_id"] = json!("loaded_steady_v1");
+    f.write("control-request.json", &req);
+    let (code, v) = f.call(
+        &[
+            "probe-controls",
+            "--request",
+            "control-request.json",
+            "--out",
+            "loaded",
+        ],
+        "",
+    );
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["temperature_profile_id"], "loaded_steady_v1");
+    assert_eq!(v["eligible"], false);
+    assert_eq!(v["evidence_origin"], "synthetic");
+    assert_eq!(v["temperature"]["assessment"]["compliant"], true);
+    let profile = f.read("loaded/thermal_profile.json");
+    let cpu = profile["sensors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["domain"] == "cpu")
+        .unwrap();
+    assert_eq!(cpu["operating_cap_c"], 90.0);
+    let argv = std::fs::read_to_string(f.dir.join("argv.jsonl")).unwrap();
+    assert!(!argv.contains("dumpsys activity activities"));
+    assert!(!f.dir.join("loaded/plan.json").exists());
+    assert!(!f.dir.join("legacy/devlock.d").exists());
+}
+#[test]
+fn loaded_capability_missing_typed_sensor_and_severe_hal_cannot_install_or_write() {
+    for fail in ["thermal_missing", "thermal_severe"] {
+        let f = F::new(false);
+        control_request(&f, "fake");
+        let mut req = f.read("control-request.json");
+        req["temperature_profile_id"] = json!("loaded_steady_v1");
+        f.write("control-request.json", &req);
+        let (code, v) = f.call(
+            &[
+                "probe-controls",
+                "--request",
+                "control-request.json",
+                "--out",
+                "loaded",
+            ],
+            fail,
+        );
+        assert_eq!(code, 1, "{fail}: {v}");
+        assert!(!f.dir.join("legacy/devlock.d").exists());
+        let argv = std::fs::read_to_string(f.dir.join("argv.jsonl")).unwrap();
+        assert!(!argv.contains("mkdir /data/local/tmp"));
+    }
+}
+
+#[test]
+fn loaded_prepare_freezes_real_raw_contract_and_three_independent_windows_but_fixture_is_blocked() {
+    let f = F::new(false);
+    let mut req = f.read("request.json");
+    req["temperature_profile_id"] = json!("loaded_steady_v1");
+    f.write("request.json", &req);
+    let (code, v) = f.prepare("");
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["status"], "SIMULATED_BLOCKED");
+    let c = f.read("session/conditions.json");
+    assert_eq!(c["schema"], "phonefarm/confirmation_conditions@2");
+    assert_eq!(c["policy"]["version"], 2);
+    assert!(c["policy"]["cool_c"].is_null());
+    assert!(c["policy"]["temp_cap_c"].is_null());
+    for i in 0..3 {
+        let raw = f.read(&format!("session/admission_{i}-run.json"));
+        assert_eq!(raw["schema"], "phonefarm/run_one_bundle@2");
+        assert!(raw["raw"].get("cold").is_none());
+        assert!(raw["raw"]["thermal_admission"].is_object());
+        assert!(raw["raw"]["thermal_window"].is_object());
+    }
+    let plan = f.read("session/plan.json");
+    assert_eq!(plan["temperature_contract"]["receiver_policy_version"], 2);
+    assert_eq!(
+        plan["exploration_artifact_sha256"]
+            .as_array()
+            .unwrap()
+            .len(),
+        12
+    );
+    assert!(!f.dir.join("legacy/devlock.d").exists());
+}
+#[test]
+fn loaded_whole_thermal_failure_keeps_durable_barrier_without_sampling_further_baselines() {
+    for fail in [
+        "thermal_window_short",
+        "thermal_window_hot",
+        "thermal_sampler_exit",
+    ] {
+        let f = F::new(false);
+        let mut req = f.read("request.json");
+        req["temperature_profile_id"] = json!("loaded_steady_v1");
+        f.write("request.json", &req);
+        let (code, v) = f.prepare(fail);
+        assert_eq!(code, 1, "{fail}:{v}");
+        assert!(f.dir.join("legacy/devlock.d/phonefarm-lease.json").exists());
+        assert!(!f.dir.join("session/admission_1-run.json").exists());
+        assert!(!f.dir.join("session/plan.json").exists());
+    }
+}
+
+#[test]
+fn loaded_explicit_cadence_freezes_two_metrics_while_charging_does_not_silently_change_efficiency()
+{
+    let f = F::new(false);
+    let mut req = f.read("request.json");
+    req["temperature_profile_id"] = json!("loaded_steady_v1");
+    req["goal"] = json!("render_cadence");
+    f.write("request.json", &req);
+    let (code, v) = f.prepare("power");
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["status"], "SIMULATED_BLOCKED");
+    let c = f.read("session/conditions.json");
+    assert_eq!(c["policy"]["goal"], "render_cadence");
+    assert_eq!(
+        c["policy"]["required_metrics"],
+        json!(["frame_p95", "fps_mean"])
+    );
+    assert_eq!(
+        f.read("session/plan.json")["metrics"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(!f.dir.join("legacy/devlock.d").exists());
+}
+#[test]
+fn unsupported_display_goal_rejects_before_transport() {
+    let f = F::new(false);
+    let mut req = f.read("request.json");
+    req["goal"] = json!("display_smoothness");
+    f.write("request.json", &req);
+    let (code, _) = f.prepare("");
+    assert_eq!(code, 1);
+    assert!(!f.dir.join("argv.jsonl").exists());
+}
+
+#[test]
+fn loaded_cadence_driver_freeze_ten_arms_and_actual_judge_cannot_promote_synthetic() {
+    let f = F::new(false);
+    let mut req = f.read("request.json");
+    req["temperature_profile_id"] = json!("loaded_steady_v1");
+    req["goal"] = json!("render_cadence");
+    f.write("request.json", &req);
+    assert_eq!(f.prepare("").0, 0);
+    f.freeze();
+    let prepared_bytes = std::fs::read(f.dir.join("session/prepared.manifest.json")).unwrap();
+    let mut prepared = f.read("session/prepared.manifest.json");
+    assert!(prepared["hashes"]
+        .get("pre-probe_0-thermal.raw.tsv")
+        .is_some());
+    prepared["hashes"]
+        .as_object_mut()
+        .unwrap()
+        .remove("pre-probe_0-thermal.raw.tsv");
+    f.write("session/prepared.manifest.json", &prepared);
+    let (code, bad) = f.collect();
+    assert_eq!(code, 1, "{bad}");
+    assert!(bad["error"]
+        .as_str()
+        .unwrap()
+        .contains("prepared evidence manifest"));
+    assert!(!f.dir.join("session/collection.started.json").exists());
+    std::fs::write(f.dir.join("session/prepared.manifest.json"), prepared_bytes).unwrap();
+    let (code, v) = f.collect();
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["status"], "SIMULATED_BLOCKED");
+    let samples = f.read("session/samples.json");
+    let mut seen = std::collections::BTreeSet::new();
+    for pair in samples["pairs"].as_array().unwrap() {
+        for side in ["a", "b"] {
+            let report = f.read(&format!(
+                "session/{}",
+                pair[format!("{side}_report")].as_str().unwrap()
+            ));
+            assert_eq!(report["schema"], "phonefarm/confirmation_observation@2");
+            assert_eq!(report["status"], "BLOCKED");
+            assert_eq!(report["qualification"]["version"], 2);
+            assert_eq!(report["qualification"]["eligible"], false);
+            assert_eq!(
+                report["confirmation_binding"]["thermal_contract"]["profile_id"],
+                "loaded_steady_v1"
+            );
+            for key in ["thermal_admission_sha256", "thermal_window_sha256"] {
+                assert!(seen.insert(
+                    report["confirmation_binding"]["raw_artifacts"][key]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                ));
+            }
+        }
+    }
+    assert_eq!(seen.len(), 20);
+    if let Some(bin) = std::env::var_os("PHONEFARM_DRIVER_GOL_BIN") {
+        let mut cmd = Command::new(bin);
+        cmd.args(["confirm", "judge", "--frozen"])
+            .arg(f.dir.join("frozen.json"))
+            .arg("--samples")
+            .arg(f.dir.join("session/samples.json"))
+            .arg("--out")
+            .arg(f.dir.join("loaded-judge.json"));
+        let out = cmd.output().unwrap();
+        f.receipt("loaded-gol-judge", &cmd, &out);
+        assert!(!out.status.success());
+        let r = f.read("loaded-judge.json");
+        assert_eq!(r["verdict"], "BLOCKED");
+        assert_eq!(r["promotion_allowed"], false);
+        assert_eq!(r["real_game_optimization_proven"], false);
+        assert_eq!(r["report_hashes"].as_object().unwrap().len(), 10);
+    }
+}
+
+#[test]
+fn loaded_restore_target_is_post_warmup_state_before_remote_writes_for_probe_and_prepare() {
+    for capability in [true, false] {
+        let f = F::new(false);
+        let dir = if capability { "loaded" } else { "session" };
+        let (code, v) = if capability {
+            control_request(&f, "fake");
+            let mut req = f.read("control-request.json");
+            req["temperature_profile_id"] = json!("loaded_steady_v1");
+            f.write("control-request.json", &req);
+            f.call(
+                &[
+                    "probe-controls",
+                    "--request",
+                    "control-request.json",
+                    "--out",
+                    dir,
+                ],
+                "loaded_cpu_drift",
+            )
+        } else {
+            let mut req = f.read("request.json");
+            req["temperature_profile_id"] = json!("loaded_steady_v1");
+            req["goal"] = json!("render_cadence");
+            f.write("request.json", &req);
+            f.prepare("loaded_cpu_drift")
+        };
+        assert_eq!(code, 0, "capability={capability}: {v}");
+        let device = f.read("fake-state.json");
+        assert!(device["snapshot_before_warmup"]
+            .as_str()
+            .unwrap()
+            .contains("cpu.policy0.scaling_max=1000"));
+        let initial = std::fs::read_to_string(f.dir.join(dir).join("initial.snapshot")).unwrap();
+        assert!(initial.contains("cpu.policy0.scaling_max=600"));
+        let fields = |raw: &str| {
+            raw.lines()
+                .filter(|line| !line.starts_with('#'))
+                .map(String::from)
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(
+            fields(&initial),
+            fields(device["snapshot"].as_str().unwrap())
+        );
+        let argv = std::fs::read_to_string(f.dir.join("argv.jsonl")).unwrap();
+        let commands: Vec<Value> = argv
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        let warmup = commands
+            .iter()
+            .position(|v| v["stdin"].as_str().unwrap().matches("sh -c").count() >= 6)
+            .unwrap();
+        let snapshot = commands
+            .iter()
+            .position(|v| v["stdin"].as_str().unwrap().contains("# device_snapshot"))
+            .unwrap();
+        let installation = commands
+            .iter()
+            .position(|v| {
+                v["command"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("set -eu; umask 077; mkdir ")
+            })
+            .unwrap();
+        assert!(warmup < snapshot && snapshot < installation);
+    }
+}
+
+#[test]
+fn loaded_prepare_checks_fresh_profile_after_install_before_first_control_write() {
+    let f = F::new(false);
+    let mut req = f.read("request.json");
+    req["temperature_profile_id"] = json!("loaded_steady_v1");
+    req["goal"] = json!("render_cadence");
+    f.write("request.json", &req);
+    let (code, v) = f.prepare("thermal_hot_before_probe");
+    assert_eq!(code, 1, "{v}");
+    assert_eq!(v["status"], "BLOCKED");
+    assert!(f.dir.join("legacy/devlock.d/phonefarm-lease.json").exists());
+    let argv = std::fs::read_to_string(f.dir.join("argv.jsonl")).unwrap();
+    assert!(argv.contains("mkdir "));
+    assert!(!argv.contains("'probe' 'probe_0'"));
+    assert!(!f.dir.join("session/admission-0-bundle.json").exists());
+}
+
+#[test]
+fn actual_remote_prepare_probe_rechecks_thermal_before_apply_without_transport() {
+    // Execute the exact production case body with host-owned stubs. No Android device.
+    let source = include_str!("../../loop_v1/tools/confirmation_worker.sh");
+    let body = source
+        .split("  probe|control_probe)\n")
+        .nth(1)
+        .unwrap()
+        .split("    ;;\n  sample)")
+        .next()
+        .unwrap();
+    for (mode, thermal_exit, should_apply) in [
+        ("probe", 82, false),
+        ("probe", 0, true),
+        ("control_probe", 82, false),
+    ] {
+        let f = F::new(false);
+        let worker_dir = f.dir.join("worker");
+        std::fs::create_dir_all(worker_dir.join("probe_0")).unwrap();
+        std::fs::write(
+            worker_dir.join("thermal_sample.sh"),
+            format!("#!/bin/sh\nprintf 'UPTIME\t0\nHAL_STATUS\t3\n'\nexit {thermal_exit}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            worker_dir.join("probe_0.plan.tsv"),
+            "gpu.min_pwrlevel\tsysfs\t/mock/min_pwrlevel\t3\n",
+        )
+        .unwrap();
+        let script = format!(
+            r#"set -eu
+D=$1; R="$D/probe_0"; RUN=probe_0; MODE=$2
+intent() {{ :; }}
+mkdir() {{ :; }}
+snapshot() {{ :; }}
+cleanup_failure() {{ :; }}
+apply_plan() {{ printf 'applied\n' > "$D/applied"; }}
+read_value() {{ printf '3\n'; }}
+sleep() {{ :; }}
+thermal_point_uptime() {{ printf '0\n'; }}
+thermal_uptime() {{ printf '0\n'; }}
+thermal_deadline() {{ printf '%s\n' "$2"; }}
+thermal_wait_until() {{ :; }}
+restore_controls() {{ :; }}
+restore_trace() {{ :; }}
+release_master() {{ :; }}
+{body}"#
+        );
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg(script)
+            .arg("owned-probe-check")
+            .arg(&worker_dir)
+            .arg(mode);
+        let out = cmd.output().unwrap();
+        f.receipt("actual-worker-thermal-gate", &cmd, &out);
+        assert_eq!(
+            worker_dir.join("applied").exists(),
+            should_apply,
+            "mode={mode}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.status.success(), should_apply);
+        if !should_apply {
+            let raw =
+                std::fs::read_to_string(worker_dir.join("probe_0/thermal_hold.raw.tsv")).unwrap();
+            assert!(
+                raw.contains("HAL_STATUS\t3"),
+                "failed sample raw output must remain diagnostic evidence"
+            );
+            assert_eq!(out.status.code(), Some(82));
+        }
+    }
+}
+
+#[test]
+fn absolute_capability_accepts_diagnostic_fluctuation_without_any_performance_upgrade() {
+    let f = F::new(false);
+    control_request(&f, "fake");
+    let mut req = f.read("control-request.json");
+    req["temperature_profile_id"] = json!("capability_absolute_v1");
+    f.write("control-request.json", &req);
+    let (code, v) = f.call(
+        &[
+            "probe-controls",
+            "--request",
+            "control-request.json",
+            "--out",
+            "absolute",
+        ],
+        "capability_fluctuating",
+    );
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["status"], "SIMULATED_CONTROL_RESTORED");
+    assert_eq!(v["temperature"]["stable_reference_required"], false);
+    assert_eq!(v["temperature"]["completion"]["samples"], 4);
+    assert_eq!(
+        v["temperature"]["diagnostic_reference"]["schema"],
+        "phonefarm/thermal_capability_diagnostics@1"
+    );
+    assert_eq!(
+        v["temperature_reference_purpose"],
+        "diagnostic_only_no_comparison"
+    );
+    for key in [
+        "eligible",
+        "experiment_eligible",
+        "real_game_optimization_proven",
+        "promotion_allowed",
+        "actual_clock_sustained_proven",
+    ] {
+        assert_eq!(v[key], false);
+    }
+    assert_eq!(v["evidence_origin"], "synthetic");
+    assert!(!f.dir.join("absolute/plan.json").exists());
+    assert!(!f.dir.join("legacy/devlock.d").exists());
+    let (code, refusal) = f.call(
+        &[
+            "collect",
+            "--session",
+            "absolute",
+            "--frozen",
+            "missing.json",
+        ],
+        "",
+    );
+    assert_eq!(code, 1);
+    assert!(refusal["error"]
+        .as_str()
+        .unwrap()
+        .contains("control-only absolute capability"));
+    let f = F::new(false);
+    let mut r = f.read("request.json");
+    r["temperature_profile_id"] = json!("capability_absolute_v1");
+    f.write("request.json", &r);
+    let (code, v) = f.prepare("");
+    assert_eq!(code, 1, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("temperature profile"));
+    assert!(!f.dir.join("argv.jsonl").exists());
+}
+#[test]
+fn absolute_capability_bad_evidence_and_unknown_restore_still_block() {
+    for fail in [
+        "thermal_missing",
+        "thermal_wrong_unit",
+        "thermal_severe",
+        "thermal_override",
+        "thermal_short_admission",
+        "control_hold_hot",
+        "control_hold_severe",
+        "control_hold_incomplete",
+        "restore",
+        "closure_unknown",
+    ] {
+        let f = F::new(false);
+        control_request(&f, "fake");
+        let mut r = f.read("control-request.json");
+        r["temperature_profile_id"] = json!("capability_absolute_v1");
+        f.write("control-request.json", &r);
+        let (code, v) = f.call(
+            &[
+                "probe-controls",
+                "--request",
+                "control-request.json",
+                "--out",
+                "absolute",
+            ],
+            fail,
+        );
+        assert_eq!(code, 1, "{fail}: {v}");
+        assert_eq!(v["eligible"], false);
+        assert!(!f.dir.join("absolute/control-report.json").exists());
+        if fail.starts_with("control_hold") || ["restore", "closure_unknown"].contains(&fail) {
+            assert!(
+                f.dir.join("legacy/devlock.d/phonefarm-lease.json").exists(),
+                "{fail}"
+            );
+        } else {
+            assert!(!f.dir.join("absolute/initial.snapshot").exists(), "{fail}");
+            assert!(!f.dir.join("legacy/devlock.d").exists(), "{fail}");
+        }
+    }
+}
+#[test]
+fn old_loaded_profile_still_rejects_three_point_one_degree_range_before_control() {
+    let f = F::new(false);
+    control_request(&f, "fake");
+    let mut r = f.read("control-request.json");
+    r["temperature_profile_id"] = json!("loaded_steady_v1");
+    f.write("control-request.json", &r);
+    let (code, v) = f.call(
+        &[
+            "probe-controls",
+            "--request",
+            "control-request.json",
+            "--out",
+            "loaded",
+        ],
+        "thermal_drift_31",
+    );
+    assert_eq!(code, 1, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("thermally stable"));
+    assert!(!f.dir.join("loaded/initial.snapshot").exists());
     assert!(!f.dir.join("legacy/devlock.d").exists());
 }
