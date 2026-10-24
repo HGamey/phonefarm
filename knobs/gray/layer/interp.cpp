@@ -14,6 +14,7 @@
 // 任何一步放弃合成都只送真实帧 N (与不开层时相同), 原因计数进 marker 的 fallbacks。
 #include "interp.h"
 #include "framedump.h"
+#include "interp_sc.h"
 
 #include <android/log.h>
 #include <dlfcn.h>
@@ -462,10 +463,12 @@ bool ip_init_from_props() {
 
 bool ip_on() { return g_on; }
 
-bool ip_wants_surface_hook() { return g_on && g_fps_vote > 0; }
+bool ip_wants_surface_hook() { return g_on && (g_fps_vote > 0 || sc_requested()); }
 
 void ip_on_android_surface(ANativeWindow* w) {
-    if (!g_on || g_fps_vote <= 0 || !w) return;
+    if (!g_on || !w) return;
+    sc_on_window(w);   // 子图层后端要挂在这个窗口下 (没要求时空操作)
+    if (g_fps_vote <= 0) return;
     typedef int32_t (*SetFrameRate)(ANativeWindow*, float, int8_t);
     static SetFrameRate fn = nullptr;
     if (!fn) {
@@ -537,6 +540,7 @@ void ip_on_destroy_device(VkDevice dev) {
         if (s.acq) D->DestroySemaphore(D->dev, s.acq, nullptr);
         for (auto x : s.acqx) if (x) D->DestroySemaphore(D->dev, x, nullptr);
     }
+    sc_on_destroy_device(D->dev);
     if (D->pool) D->DestroyCommandPool(D->dev, D->pool, nullptr);
     for (auto s : D->retired_sems) if (s && D->DestroySemaphore) D->DestroySemaphore(D->dev, s, nullptr);
     g_devs.erase(fkey(dev));
@@ -671,6 +675,83 @@ VkResult ip_on_present(VkQueue q, const VkPresentInfoKHR* pi, PFN_vkQueuePresent
         sl.acq_dirty = false;
     }
     poll_timing_locked(D, sc, S);
+    if (sc_requested() && sc_ready(D->dev)) {
+        // 子图层后端: 真实帧拷一份、合成帧画进层自己的缓冲, 经 ASurfaceTransaction 直接交给 SF (绕开缓冲队列的限帧);
+        // 游戏的帧照常送到它自己的 swapchain (被子图层盖住)
+        const int m = (int)g_mult;
+        std::vector<ScBuf*> bufs;
+        for (int k = 0; k <= m; k++) {
+            ScBuf* b = sc_next_buffer(D->dev, S.w, S.h, (uint32_t)(4 * (m + 1)));
+            if (!b) break;
+            bufs.push_back(b);
+        }
+        if ((int)bufs.size() != m + 1) return bail("sc_buffers");
+        VkImage N = S.imgs[idxN];
+        D->ResetCommandBuffer(sl.cb, 0);
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, nullptr};
+        D->BeginCommandBuffer(sl.cb, &bi);
+        const VkPipelineStageFlags TR = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        image_barrier(D, sl.cb, N, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 0, VK_ACCESS_TRANSFER_READ_BIT, TR, TR);
+        bool use_hist = S.hist != VK_NULL_HANDLE;
+        auto reg = registry().find(g_mode);
+        bool synth_any = S.hist_valid;   // 第一帧没有历史: 只送真实帧
+        for (int k = 0; k < m && synth_any; k++) {
+            ScBuf* b = bufs[k];
+            sc_acquire_barrier(sl.cb, D->CmdPipelineBarrier, b->img, family, b->fresh);
+            bool custom = false;
+            if (reg != registry().end()) {
+                IpSynthCtx cx;
+                cx.dev = D->dev; cx.queue = q; cx.cb = sl.cb; cx.prev = S.hist; cx.cur = N; cx.dst = b->img;
+                cx.w = S.w; cx.h = S.h; cx.fmt = S.fmt; cx.swap_usage = S.usage; cx.queue_family = family; cx.frame = frame;
+                cx.gdpa = D->gdpa; cx.t = (float)(k + 1) / (float)(m + 1); cx.sub = (uint32_t)k; cx.subs = (uint32_t)m;
+                custom = reg->second.fn(cx, reg->second.user);
+                if (!custom) g_fb["synth_declined"]++;
+            }
+            if (!custom) copy_full(D, sl.cb, g_mode == "dupcur" ? N : S.hist, b->img, S.w, S.h);
+            sc_release_barrier(sl.cb, D->CmdPipelineBarrier, b->img, family);
+        }
+        ScBuf* rb = bufs[m];
+        sc_acquire_barrier(sl.cb, D->CmdPipelineBarrier, rb->img, family, rb->fresh);
+        copy_full(D, sl.cb, N, rb->img, S.w, S.h);
+        sc_release_barrier(sl.cb, D->CmdPipelineBarrier, rb->img, family);
+        if (use_hist) {
+            image_barrier(D, sl.cb, S.hist, S.hist_valid ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
+                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, TR, TR);
+            copy_full(D, sl.cb, N, S.hist, S.w, S.h);
+            image_barrier(D, sl.cb, S.hist, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, TR, TR);
+        }
+        image_barrier(D, sl.cb, N, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_READ_BIT, 0, TR, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+        D->EndCommandBuffer(sl.cb);
+        std::vector<VkPipelineStageFlags> stages(pi->waitSemaphoreCount, TR);
+        VkSubmitInfo sub{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        sub.waitSemaphoreCount = pi->waitSemaphoreCount; sub.pWaitSemaphores = pi->pWaitSemaphores; sub.pWaitDstStageMask = stages.data();
+        sub.commandBufferCount = 1; sub.pCommandBuffers = &sl.cb;
+        sub.signalSemaphoreCount = 1; sub.pSignalSemaphores = &S.sems[idxN];
+        D->ResetFences(D->dev, 1, &sl.fence);
+        if (D->QueueSubmit(q, 1, &sub, sl.fence) != VK_SUCCESS) { g_fb["submit_fail"]++; return bail("sc_submit"); }
+        S.hist_valid = use_hist;
+        // 子图层要的是写完的缓冲: 本帧在这里等 GPU (最多 50 ms), 交出去的 acquire fence 用 -1
+        bool done = D->WaitForFences(D->dev, 1, &sl.fence, VK_TRUE, 50000000ull) == VK_SUCCESS;
+        if (!done) { sl.busy = true; g_fb["sc_gpu_wait_timeout"]++; }
+        S.synth_count++;
+        const uint64_t R = S.refresh_ns ? S.refresh_ns : 16666667;
+        uint64_t period = S.ema_ns > 0 ? (uint64_t)S.ema_ns : 2 * R;
+        uint64_t step = period / (uint64_t)(m + 1);
+        if (step < R) step = R;
+        const uint64_t t0 = now_ns();
+        std::vector<std::pair<ScBuf*, int64_t>> show;
+        int shown_synth = 0;
+        for (int k = 0; k < m && synth_any && done; k++) { show.push_back({bufs[k], (int64_t)(t0 + (uint64_t)k * step)}); shown_synth++; }
+        if (done) show.push_back({rb, (int64_t)(t0 + (uint64_t)shown_synth * step)});
+        g_real++; g_synth += shown_synth;
+        g_cpu_us.push((now_ns() - t) / 1000);
+        VkSemaphore semN = S.sems[idxN];
+        lk.unlock();
+        sc_show(D->dev, show, S.w, S.h);
+        VkPresentInfoKHR pn = *pi;
+        pn.waitSemaphoreCount = 1; pn.pWaitSemaphores = &semN;
+        return next(q, &pn);
+    }
     if (g_mult > 1) {   // 多帧插: m 张合成帧 (t = k/(m+1)) 依次送, 最后送真实帧; 只带 presentID 回读, 不定时刻
         const int m = (int)g_mult;
         std::vector<uint32_t> idx;
@@ -957,6 +1038,7 @@ std::string ip_json() {
     j += ",\"layer_cpu_us\":" + g_cpu_us.json();
     j += ",\"fallbacks\":{" + fb + "}";
     j += ",\"fps_vote\":\"" + g_fps_vote_result + "\"";
+    if (sc_requested()) j += ",\"sc\":" + sc_json();
     j += ",\"swapchain\":" + swap;
     j += std::string(",\"csv\":") + (g_csv_f ? "true" : "false");
     j += "}";

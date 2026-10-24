@@ -39,6 +39,7 @@
 #endif
 #include "interp.h"
 #include "selfsr.h"
+#include "interp_sc.h"
 #include "artifact_stats.h"
 #ifdef RK_DYNAMIC_UPOP_BUILD
 #include "artifact_metadata.h"
@@ -978,12 +979,15 @@ static VKAPI_ATTR VkResult VKAPI_CALL rk_CreateDevice(
     // 加载器链节已推进, 复制一份 create info 改扩展列表即可 (pNext 链原样共享)。
     VkDeviceCreateInfo ip_ci;
     std::vector<const char*> ip_exts;
-    bool ip_ext_enabled = false;
+    bool ip_ext_enabled = false, sc_ext_enabled = false;
     const VkDeviceCreateInfo* orig_ci = ci;
     if (ip_on()) {
         bool supported = false, already = false;
-        for (uint32_t i = 0; i < ci->enabledExtensionCount; i++)
+        std::vector<std::string> avail, on;
+        for (uint32_t i = 0; i < ci->enabledExtensionCount; i++) {
+            on.push_back(ci->ppEnabledExtensionNames[i]);
             if (!strcmp(ci->ppEnabledExtensionNames[i], VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME)) already = true;
+        }
         PFN_vkEnumerateDeviceExtensionProperties enumDevExt = nullptr;
         {
             std::lock_guard<std::mutex> lk(g_mtx);
@@ -991,32 +995,42 @@ static VKAPI_ATTR VkResult VKAPI_CALL rk_CreateDevice(
             if (it == g_inst.end() && g_inst.size() == 1) it = g_inst.begin();
             if (it != g_inst.end()) enumDevExt = it->second.EnumDevExt;
         }
-        if (already) supported = true;
-        else if (enumDevExt) {
+        if (enumDevExt) {
             uint32_t n = 0;
             if (enumDevExt(phys, nullptr, &n, nullptr) == VK_SUCCESS && n) {
                 std::vector<VkExtensionProperties> ep(n);
                 enumDevExt(phys, nullptr, &n, ep.data());
-                for (uint32_t i = 0; i < n; i++) if (!strcmp(ep[i].extensionName, VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME)) supported = true;
+                for (uint32_t i = 0; i < n; i++) {
+                    avail.push_back(ep[i].extensionName);
+                    if (!strcmp(ep[i].extensionName, VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME)) supported = true;
+                }
             }
         }
+        if (already) supported = true;
         const char* want = ip_wanted_device_ext(supported);
-        if (want && !already) {
+        // 子图层后端 (interp_backend=sc) 要的 AHardwareBuffer 导入扩展及其依赖
+        std::vector<const char*> sc_exts = sc_wanted_device_exts(avail, on);
+        bool ahb_on = false;
+        for (auto& e : on) if (e == "VK_ANDROID_external_memory_android_hardware_buffer") ahb_on = true;
+        if ((want && !already) || !sc_exts.empty()) {
             ip_exts.assign(ci->ppEnabledExtensionNames, ci->ppEnabledExtensionNames + ci->enabledExtensionCount);
-            ip_exts.push_back(want);
+            if (want && !already) ip_exts.push_back(want);
+            for (auto* e : sc_exts) { ip_exts.push_back(e); if (!strcmp(e, "VK_ANDROID_external_memory_android_hardware_buffer")) ahb_on = true; }
             ip_ci = *ci;
             ip_ci.enabledExtensionCount = (uint32_t)ip_exts.size();
             ip_ci.ppEnabledExtensionNames = ip_exts.data();
             ci = &ip_ci;
-            ip_ext_enabled = true;
-        } else if (want && already) ip_ext_enabled = true;
-        RK_LOG("interp: VK_GOOGLE_display_timing supported=%d already=%d enabled=%d", (int)supported, (int)already, (int)ip_ext_enabled);
+        }
+        ip_ext_enabled = want != nullptr;
+        sc_ext_enabled = sc_requested() && ahb_on;
+        RK_LOG("interp: VK_GOOGLE_display_timing supported=%d already=%d enabled=%d; sc 扩展 +%zu ahb=%d", (int)supported,
+               (int)already, (int)ip_ext_enabled, sc_exts.size(), (int)sc_ext_enabled);
     }
     VkResult r = createFunc(phys, ci, a, pDev);
-    if (r != VK_SUCCESS && ip_ext_enabled && ci == &ip_ci) {
+    if (r != VK_SUCCESS && ci == &ip_ci) {
         // 重试只在「没有别的层夹在中间」时可靠 (加载器链节已被推进一次); 本机只挂本层
         RK_LOG("interp: 加扩展后 vkCreateDevice 失败 (%d), 退回原参数", (int)r);
-        ip_ext_enabled = false;
+        ip_ext_enabled = false; sc_ext_enabled = false;
         ci = orig_ci;
         r = createFunc(phys, ci, a, pDev);
     }
@@ -1153,6 +1167,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL rk_CreateDevice(
                                                                                   : UINT32_MAX;
     if (fd_on()) fd_on_device(inst, phys, *pDev, gipa, gdpa, sdld, sole_family);
     if (ip_on()) ip_on_device(inst, phys, *pDev, gipa, gdpa, sdld, sole_family, ip_ext_enabled);
+    if (ip_on() && sc_requested())
+        sc_on_device(*pDev, phys, gdpa, inst && gipa ? (PFN_vkGetPhysicalDeviceMemoryProperties)gipa(inst, "vkGetPhysicalDeviceMemoryProperties") : nullptr,
+                     sc_ext_enabled);
     if (sr_on()) {
         // 多个队列族时取第一个 (游戏的图形队列一般排第一); 日志里记下, 送显队列不在这个族上会提交失败并退回原样
         uint32_t fam = sole_family != UINT32_MAX ? sole_family

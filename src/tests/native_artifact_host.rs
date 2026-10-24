@@ -72,6 +72,8 @@ fn host_native_counters_and_actual_layer_hooks() {
             .arg(root.join("layer/interp.cpp"))
             // selfsr (送显前超分), build_layer.sh 一起编; 没有 selfsr_spv.h 时模块自己降级
             .arg(root.join("layer/selfsr.cpp"))
+            // 插帧子图层后端 (interp_sc), 没有 android 头文件时模块是空操作
+            .arg(root.join("layer/interp_sc.cpp"))
             .arg("-o")
             .arg(&exe)
             .output()

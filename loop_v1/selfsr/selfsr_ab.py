@@ -37,7 +37,7 @@ SR_OPTS = ("algo", "direct")   # → debug.knobs.selfsr_<键>
 # 截图 (2688x1216) 右上角那排固定图标: 整屏锐度被场景主导 (冷启动后角色/镜头可能不同), 这块内容各臂相同
 HUD_BOX = (1760, 10, 2600, 130)
 IP_PROPS = ("debug.knobs.interp", "debug.knobs.interp_mode", "debug.knobs.interp_fps")
-IP_TUNE = ("pacing", "stamp", "acquire_ms", "extra_images", "lead_ns", "mult", "panel", "framepacing")
+IP_TUNE = ("pacing", "stamp", "acquire_ms", "extra_images", "lead_ns", "mult", "backend", "sc_dst", "panel", "framepacing")
 FP_PROP = "vendor.perf.framepacing.enable"   # 高通 perf HAL 的游戏帧节奏; framepacing=<值> 进世界后设, 收尾写回原值   # panel 不是层属性, 见 prepare   # ip 臂第 4 段可设的 debug.knobs.interp_<键>
 
 
@@ -137,6 +137,19 @@ def current_mode(dev, pkg):
     return t.split("current mode:")[1].split(",")[0].strip() if "current mode:" in t else "unknown"
 
 
+def timestats_layer(text, needle):
+    """timestats 里名字含 needle 的图层的 totalFrames (取帧数最多的那个) 与全局 displayOnTime。"""
+    g = {"displayOnTime": None, "layer_frames": None}
+    m = re.search(r"^displayOnTime = (\d+)", text, re.M)
+    g["displayOnTime"] = int(m.group(1)) if m else None
+    for blk in text.split("layerName = ")[1:]:
+        if needle in blk.splitlines()[0]:
+            f = re.search(r"^totalFrames = (\d+)", blk, re.M)
+            if f and int(f.group(1)) > (g["layer_frames"] or 0):
+                g["layer_frames"] = int(f.group(1))
+    return g
+
+
 def measure(dev, a, name, out):
     dev_trace = f"/data/local/tmp/selfsr_trace_{name}.txt"
     ts_cmd = ("dumpsys SurfaceFlinger --timestats -disable -clear >/dev/null; "
@@ -146,7 +159,9 @@ def measure(dev, a, name, out):
     tr = subprocess.Popen(f"adb -s {shlex.quote(a.serial)} shell su -c "
                           + shlex.quote(shlex.quote(f"sh {DEV_TRACE} {a.window} {dev_trace} {a.pkg}")),
                           shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    ts = parse_timestats(dev.shell(ts_cmd, timeout=a.window + 60), a.pkg)
+    ts_text = dev.shell(ts_cmd, timeout=a.window + 60)
+    ts = parse_timestats(ts_text, a.pkg)
+    ts_sc = timestats_layer(ts_text, "selfsr_interp")   # 插帧子图层后端的图层
     tr.wait(timeout=a.window + 90)
     local_trace = os.path.join(out, "traces", f"{name}.txt")
     dev.adb(f"exec-out su -c {shlex.quote('cat ' + dev_trace)} > {shlex.quote(local_trace)}")
@@ -169,6 +184,8 @@ def measure(dev, a, name, out):
     return {"in_game": a.pkg in fg,
             "display_fps": round(ts["layer_frames"] / span, 2) if ts.get("layer_frames") else None,
             "display_hz": ts.get("display_hz"), "missed_frames": ts.get("missedFrames"),
+            "display_fps_sc": round(ts_sc["layer_frames"] / ((ts_sc.get("displayOnTime") or a.window * 1000) / 1000), 2)
+                              if ts_sc.get("layer_frames") else None,
             "game_fps": game.get("fps_mean"), "game_frame_p95_ms": game.get("frame_p95"),
             "gpu_active_ms": game.get("gpu_active_mean"),
             "out_res": src, "sharp_full": sharpness(shot), "sharp_hud": sharpness(shot, HUD_BOX), "shot": shot}
@@ -542,7 +559,7 @@ def main():
     good = [r for r in arms if not r.get("error") and r.get("in_game")
             and (not uses_layer(parse_kind(r["kind"])) or (r.get("layer_loaded") and r.get("layer_removed")))]
     pairs = sorted({r["pair"] for r in good if sum(1 for x in good if x["pair"] == r["pair"]) == 2})
-    metrics = ["display_fps", "game_fps", "game_frame_p95_ms", "gpu_active_ms", "sharp_full", "sharp_hud", "ssim_vs_native_ref", "missed_frames",
+    metrics = ["display_fps", "display_fps_sc", "game_fps", "game_frame_p95_ms", "gpu_active_ms", "sharp_full", "sharp_hud", "ssim_vs_native_ref", "missed_frames",
                "display_latency_p50_ms", "displayed_per_s"]
     res = {}
     for m in metrics:
@@ -561,7 +578,7 @@ def main():
               "out_res": {side: sorted({tuple(r["out_res"]) for r in good if r["side"] == side and r.get("out_res")}) for side in "AB"},
               "metrics": res, "min_p_possible": 2 / 2 ** len(pairs) if pairs else None}
     json.dump(report, open(os.path.join(out, "report.json"), "w"), ensure_ascii=False, indent=1)
-    names = {"display_fps": "上屏帧率", "game_fps": "游戏渲染帧率 (GPU 提交)", "game_frame_p95_ms": "游戏渲染 p95 帧时 (ms)",
+    names = {"display_fps": "上屏帧率", "display_fps_sc": "子图层上屏帧率 (插帧 sc 后端)", "game_fps": "游戏渲染帧率 (GPU 提交)", "game_frame_p95_ms": "游戏渲染 p95 帧时 (ms)",
              "gpu_active_ms": "每帧 GPU 忙碌 (ms, 均值)",
              "display_latency_p50_ms": "真实帧 present→上屏 p50 (ms)",
              "displayed_per_s": "层回读: 窗口内每秒实际上屏 (真实+合成)",
