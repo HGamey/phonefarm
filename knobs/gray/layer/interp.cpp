@@ -122,10 +122,12 @@ struct Swap {
     uint64_t synth_count = 0;
 };
 
+const int kMaxMult = 5;   // 每个真实帧最多插几张
 struct Slot {
     VkCommandBuffer cb = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
     VkSemaphore acq = VK_NULL_HANDLE;
+    VkSemaphore acqx[kMaxMult] = {};   // 多帧插 (interp_mult>1) 时第 2.. 张的 acquire 信号量, 用到时才建
     bool busy = false, acq_dirty = false;
 };
 
@@ -170,6 +172,7 @@ bool g_pacing = true;
 bool g_stamp = true;       // interp_stamp=0: 开着 display_timing 回读上屏时刻, 但不给合成/真实帧定时刻 (纯 FIFO 依次送)
 long g_lead_ns = -1;       // -1 = 一个刷新周期
 long g_extra_images = 2;
+long g_mult = 1;           // interp_mult: 每个真实帧之前插几张 (t = k/(mult+1)); >1 时不定显示时刻, 纯 FIFO
 long g_acquire_ms = 4;
 bool g_csv = true;
 long g_fps_vote = 0;                   // debug.knobs.interp_fps: 给游戏窗口投的帧率, 0 = 不投
@@ -445,7 +448,8 @@ bool ip_init_from_props() {
     std::string st = prop("debug.knobs.interp_stamp");
     g_stamp = st.empty() || st[0] == '1';
     g_lead_ns = prop_long("debug.knobs.interp_lead_ns", -1, -1, 200000000);
-    g_extra_images = prop_long("debug.knobs.interp_extra_images", 2, 1, 4);
+    g_mult = prop_long("debug.knobs.interp_mult", 1, 1, kMaxMult);
+    g_extra_images = prop_long("debug.knobs.interp_extra_images", g_mult + 1, 1, kMaxMult + 1);
     g_acquire_ms = prop_long("debug.knobs.interp_acquire_ms", 4, 0, 100);
     g_fps_vote = prop_long("debug.knobs.interp_fps", 0, 0, 240);
     std::string c = prop("debug.knobs.interp_csv");
@@ -531,6 +535,7 @@ void ip_on_destroy_device(VkDevice dev) {
     for (auto& s : D->slots) {
         if (s.fence) D->DestroyFence(D->dev, s.fence, nullptr);
         if (s.acq) D->DestroySemaphore(D->dev, s.acq, nullptr);
+        for (auto x : s.acqx) if (x) D->DestroySemaphore(D->dev, x, nullptr);
     }
     if (D->pool) D->DestroyCommandPool(D->dev, D->pool, nullptr);
     for (auto s : D->retired_sems) if (s && D->DestroySemaphore) D->DestroySemaphore(D->dev, s, nullptr);
@@ -666,6 +671,117 @@ VkResult ip_on_present(VkQueue q, const VkPresentInfoKHR* pi, PFN_vkQueuePresent
         sl.acq_dirty = false;
     }
     poll_timing_locked(D, sc, S);
+    if (g_mult > 1) {   // 多帧插: m 张合成帧 (t = k/(m+1)) 依次送, 最后送真实帧; 只带 presentID 回读, 不定时刻
+        const int m = (int)g_mult;
+        std::vector<uint32_t> idx;
+        std::vector<VkSemaphore> acqs;
+        for (int k = 0; k < m; k++) {
+            VkSemaphore& sem = k == 0 ? sl.acq : sl.acqx[k];
+            if (!sem) {
+                VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+                if (D->CreateSemaphore(D->dev, &sci, nullptr, &sem) != VK_SUCCESS) { sem = VK_NULL_HANDLE; break; }
+            }
+            uint32_t i = UINT32_MAX;
+            VkResult ar = D->AcquireNextImageKHR(D->dev, sc, (uint64_t)g_acquire_ms * 1000000ull, sem, VK_NULL_HANDLE, &i);
+            if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) { g_fb["mult_acquire_short"]++; break; }
+            if (i >= S.imgs.size() || i == idxN || !S.sems[i]) {   // 信号量已发出但图不能用: 换新信号量, 图照样送回去
+                g_fb["mult_acquire_index"]++;
+                VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+                D->DestroySemaphore(D->dev, sem, nullptr);
+                if (D->CreateSemaphore(D->dev, &sci, nullptr, &sem) != VK_SUCCESS) sem = VK_NULL_HANDLE;
+                break;
+            }
+            idx.push_back(i); acqs.push_back(sem);
+        }
+        if (idx.empty()) return bail("acquire_timeout");
+        const int got = (int)idx.size();
+        VkImage N = S.imgs[idxN];
+        D->ResetCommandBuffer(sl.cb, 0);
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, nullptr};
+        D->BeginCommandBuffer(sl.cb, &bi);
+        const VkPipelineStageFlags TR = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        image_barrier(D, sl.cb, N, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 0, VK_ACCESS_TRANSFER_READ_BIT, TR, TR);
+        bool use_hist = S.hist != VK_NULL_HANDLE;
+        auto reg = registry().find(g_mode);
+        for (int k = 0; k < got; k++) {
+            VkImage L = S.imgs[idx[k]];
+            image_barrier(D, sl.cb, L, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT, TR, TR);
+            bool custom = false;
+            if (reg != registry().end()) {
+                IpSynthCtx cx;
+                cx.dev = D->dev; cx.queue = q; cx.cb = sl.cb; cx.prev = S.hist_valid ? S.hist : VK_NULL_HANDLE; cx.cur = N; cx.dst = L;
+                cx.w = S.w; cx.h = S.h; cx.fmt = S.fmt; cx.swap_usage = S.usage; cx.queue_family = family; cx.frame = frame;
+                cx.gdpa = D->gdpa; cx.t = (float)(k + 1) / (float)(got + 1); cx.sub = (uint32_t)k; cx.subs = (uint32_t)got;
+                custom = reg->second.fn(cx, reg->second.user);
+                if (!custom) g_fb["synth_declined"]++;
+            }
+            if (!custom) {
+                VkImage src = (g_mode != "dupcur" && S.hist_valid) ? S.hist : N;
+                copy_full(D, sl.cb, src, L, S.w, S.h);
+            }
+            image_barrier(D, sl.cb, L, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_WRITE_BIT, 0, TR, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+        }
+        if (use_hist) {
+            image_barrier(D, sl.cb, S.hist, S.hist_valid ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
+                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, TR, TR);
+            copy_full(D, sl.cb, N, S.hist, S.w, S.h);
+            image_barrier(D, sl.cb, S.hist, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, TR, TR);
+        }
+        image_barrier(D, sl.cb, N, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_READ_BIT, 0, TR, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+        D->EndCommandBuffer(sl.cb);
+        std::vector<VkSemaphore> waits(pi->pWaitSemaphores, pi->pWaitSemaphores + pi->waitSemaphoreCount);
+        waits.insert(waits.end(), acqs.begin(), acqs.end());
+        std::vector<VkPipelineStageFlags> stages(waits.size(), TR);
+        std::vector<VkSemaphore> signals;
+        for (uint32_t i : idx) signals.push_back(S.sems[i]);
+        signals.push_back(S.sems[idxN]);
+        VkSubmitInfo sub{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        sub.waitSemaphoreCount = (uint32_t)waits.size(); sub.pWaitSemaphores = waits.data(); sub.pWaitDstStageMask = stages.data();
+        sub.commandBufferCount = 1; sub.pCommandBuffers = &sl.cb;
+        sub.signalSemaphoreCount = (uint32_t)signals.size(); sub.pSignalSemaphores = signals.data();
+        D->ResetFences(D->dev, 1, &sl.fence);
+        bool submitted = D->QueueSubmit(q, 1, &sub, sl.fence) == VK_SUCCESS;
+        if (!submitted) g_fb["submit_fail"]++;
+        else { sl.busy = true; S.hist_valid = use_hist; }
+        S.synth_count++;
+        bool timed = g_pacing && S.timing_ok;
+        const VkPresentTimesInfoGOOGLE* gt = game_times(pi);
+        std::vector<uint32_t> ids;
+        for (int k = 0; k < got; k++) {
+            ids.push_back(S.next_id++);
+            if (timed) track(S, Pending{ids.back(), K_SYNTH, frame, 0, 0, 0, S.next_seq++});
+        }
+        uint32_t idN2 = gt ? gt->pTimes[0].presentID : S.next_id++;
+        if (timed) track(S, Pending{idN2, K_REAL, frame, gt ? gt->pTimes[0].desiredPresentTime : 0, 0, t, S.next_seq++});
+        g_real++; g_synth += got;
+        if (got < m) g_fb["mult_partial"]++;
+        g_cpu_us.push((now_ns() - t) / 1000);
+        std::vector<VkSemaphore> sem_of;
+        for (uint32_t i : idx) sem_of.push_back(S.sems[i]);
+        VkSemaphore semN = S.sems[idxN];
+        lk.unlock();
+        VkResult rr = VK_SUCCESS;
+        for (int k = 0; k < got; k++) {
+            VkPresentTimeGOOGLE tm{ids[k], 0};
+            VkPresentTimesInfoGOOGLE pt{VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE, nullptr, 1, &tm};
+            VkPresentInfoKHR pl{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+            pl.pNext = timed ? &pt : nullptr;
+            pl.waitSemaphoreCount = submitted ? 1 : 0; pl.pWaitSemaphores = &sem_of[k];
+            pl.swapchainCount = 1; pl.pSwapchains = &sc; pl.pImageIndices = &idx[k];
+            VkResult r = next(q, &pl);
+            if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) rr = r;
+        }
+        VkPresentTimeGOOGLE tmN{idN2, 0};
+        VkPresentTimesInfoGOOGLE ptN{VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE, pi->pNext, 1, &tmN};
+        VkPresentInfoKHR pn = *pi;
+        if (submitted) { pn.waitSemaphoreCount = 1; pn.pWaitSemaphores = &semN; }
+        if (timed && !gt) pn.pNext = &ptN;
+        VkResult rN = next(q, &pn);
+        lk.lock();
+        if (rr != VK_SUCCESS) g_fb["present_l_fail"]++;
+        if (rN != VK_SUCCESS && rN != VK_SUBOPTIMAL_KHR) g_fb["present_n_fail"]++;
+        return rN;
+    }
     // 2. 层自己 acquire 一张图
     uint32_t idxL = UINT32_MAX;
     VkResult ar = D->AcquireNextImageKHR(D->dev, sc, (uint64_t)g_acquire_ms * 1000000ull, sl.acq, VK_NULL_HANDLE, &idxL);

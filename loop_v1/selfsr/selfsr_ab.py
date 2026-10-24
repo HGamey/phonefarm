@@ -35,7 +35,7 @@ SR_PROP = "debug.knobs.selfsr"
 # 截图 (2688x1216) 右上角那排固定图标: 整屏锐度被场景主导 (冷启动后角色/镜头可能不同), 这块内容各臂相同
 HUD_BOX = (1760, 10, 2600, 130)
 IP_PROPS = ("debug.knobs.interp", "debug.knobs.interp_mode", "debug.knobs.interp_fps")
-IP_TUNE = ("pacing", "stamp", "acquire_ms", "extra_images", "lead_ns", "panel")   # panel 不是层属性, 见 prepare   # ip 臂第 4 段可设的 debug.knobs.interp_<键>
+IP_TUNE = ("pacing", "stamp", "acquire_ms", "extra_images", "lead_ns", "mult", "panel")   # panel 不是层属性, 见 prepare   # ip 臂第 4 段可设的 debug.knobs.interp_<键>
 
 
 def parse_kind(s):

@@ -16,7 +16,9 @@
 //   interp_pacing       1 (缺省) = 用 VK_GOOGLE_display_timing 的 desiredPresentTime 定节奏;
 //                       0 = 不设时间戳, 只靠 FIFO 连续送两张 (要求屏幕 60 Hz 才会是 30→60)
 //   interp_lead_ns      合成帧目标显示时刻至少在「现在 + 这么多」之后, 缺省 = 一个刷新周期
-//   interp_extra_images swapchain 多要几张图给层用, 缺省 2 (受 surface maxImageCount 限制)
+//   interp_mult         每个真实帧之前插几张 (1..5, 缺省 1); >1 时第 k 张取 t=k/(mult+1), 不定显示时刻 (FIFO 依次送),
+//                       给高刷屏用 (游戏 30 帧、屏幕 144 Hz → mult=4)
+//   interp_extra_images swapchain 多要几张图给层用, 缺省 mult+1 (受 surface maxImageCount 限制)
 //   interp_acquire_ms   层自己 acquire 合成图的最长等待, 缺省 4 ms; 超时这一帧只送真实帧
 //   interp_csv          1 = 每次 present 追加一行到 <files>/knobs_interp_frames.csv (缺省 1)
 //
@@ -48,6 +50,8 @@ struct IpSynthCtx {
     uint32_t swap_usage = 0;              // swapchain 图实际的 VkImageUsageFlags
     uint32_t queue_family = 0;
     uint64_t frame = 0;                   // 本层的全局 present 序号
+    float t = 0.5f;                       // 合成帧在前后两帧之间的时刻 (0..1); 同一帧插多张时依次 1/(m+1)..m/(m+1)
+    uint32_t sub = 0, subs = 1;           // 本帧的第几张 / 共几张 (合成方式可据此复用本帧已算的运动场)
     PFN_vkGetDeviceProcAddr gdpa = nullptr;
 };
 typedef bool (*IpSynthFn)(const IpSynthCtx& c, void* user);
