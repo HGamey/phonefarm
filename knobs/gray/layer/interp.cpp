@@ -742,8 +742,10 @@ VkResult ip_on_present(VkQueue q, const VkPresentInfoKHR* pi, PFN_vkQueuePresent
         S.synth_count++;
         const uint64_t R = S.refresh_ns ? S.refresh_ns : 16666667;
         uint64_t period = S.ema_ns > 0 ? (uint64_t)S.ema_ns : 2 * R;
+        // 合成帧与真实帧在一个游戏周期里均分; 不用 swapchain 建立时记的刷新周期当下限
+        // (那时屏幕可能还是 60 Hz, 真机: 游戏 57 帧 + 下限 16.6 ms → 积压, 子图层只上屏 60/s)
         uint64_t step = period / (uint64_t)(m + 1);
-        if (step < R) step = R;
+        if (step < 2000000ull) step = 2000000ull;
         const uint64_t t0 = now_ns();
         std::vector<std::pair<ScBuf*, int64_t>> show;
         int shown_synth = 0;
