@@ -269,6 +269,26 @@ def restore_panel(dev):
         dev.su(f"setprop {FP_PROP} {shlex.quote(orig[FP_PROP])}")
 
 
+def gfrc_after_enter(dev, a, k):
+    """进世界后写本包 G-FRC+ 位并回读厂商属性核对。游戏助手会记住上次开过 G-FRC+, 启动时自己再打开
+    (全局设置只是镜像, 启动前写 000 管不住), 所以每一臂都在进世界后明确写一次: G-FRC+ 臂写目标位, 其它臂写 000。
+    返回 (属性, 错误或 None)。本机没有 G-FRC+ (属性不存在) 时什么都不做。"""
+    if dev.prop("vendor.gpp.frc.enable") in ("", None):
+        return {}, None
+    bits = k.get("gfrc") or "000"
+    cur = dev.shell("settings get global game_gfrc_mode").strip()
+    if cur in ("", "null"):
+        return {}, None
+    dev.shell(f"settings put global game_gfrc_mode {shlex.quote(set_pkg_bits(cur, a.pkg, bits))}")
+    time.sleep(8)
+    props = {p: dev.prop(f"vendor.gpp.{p}") for p in ("gfrc.interp.rate", "gfrc.upscale.ratio", "frc.enable")}
+    want_up = bits[2] == "1" and bits[0] != "0"
+    want_ip = bits[2] == "1" and bits[1] != "0"
+    if ((props["gfrc.upscale.ratio"] not in ("", "0")) != want_up) or ((props["gfrc.interp.rate"] not in ("", "0")) != want_ip):
+        return props, f"G-FRC+ 没按 {bits} 生效: {props}"
+    return props, None
+
+
 def prepare(a, k, orig_mode):
     """在设备锁下调用: Game Mode 与 selfsr 属性。"""
     dev = Dev(a.serial)
@@ -303,18 +323,10 @@ def arm_plain(a, out, name, k, orig_mode):
     if code != 0:
         rec["error"] = f"onboard: {err}"
         return rec
-    if k["kind"] == "gfrc":   # 进世界后再开 G-FRC+, 回读厂商属性确认生效 (启动前写好的不生效)
-        cur = dev.shell("settings get global game_gfrc_mode").strip()
-        dev.shell(f"settings put global game_gfrc_mode {shlex.quote(set_pkg_bits(cur, a.pkg, k['gfrc']))}")
-        time.sleep(8)
-        props = {p: dev.prop(f"vendor.gpp.{p}") for p in ("gfrc.interp.rate", "gfrc.upscale.ratio", "frc.enable")}
-        rec["gfrc_props"] = props
-        bits = k["gfrc"]
-        want_up = bits[2] == "1" and bits[0] != "0"
-        want_ip = bits[2] == "1" and bits[1] != "0"
-        if ((props["gfrc.upscale.ratio"] not in ("", "0")) != want_up) or ((props["gfrc.interp.rate"] not in ("", "0")) != want_ip):
-            rec["error"] = f"G-FRC+ 没按 {bits} 生效: {props}"
-            return rec
+    rec["gfrc_props"], err = gfrc_after_enter(dev, a, k)
+    if err:
+        rec["error"] = err
+        return rec
     time.sleep(a.settle)
     rec.update(measure(dev, a, name, out))
     dev.shell(f"am force-stop {a.pkg}")
@@ -353,6 +365,10 @@ def arm_layer(a, out, name, k, note, locked):
         code, err = onboard(a, out, name, cold=False)
         if code != 0:
             rec["error"] = f"onboard --no-cold: {err}"
+            return rec
+        rec["gfrc_props"], err = gfrc_after_enter(dev, a, k)
+        if err:
+            rec["error"] = err
             return rec
         panel = (k.get("tune") or {}).get("panel")
         if panel:   # 进世界后再设刷新率 (红魔 refresh_rate_mode), 回读 SF 刷新周期确认
