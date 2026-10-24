@@ -52,9 +52,12 @@ def parse_kind(s):
                 "tune": tune}
     if p[0] == "hwc" and len(p) == 2:
         return {"kind": "hwc", "downscale": float(p[1]), "selfsr": None}
-    if p[0] == "srip" and len(p) in (5, 6) and "x" in p[2]:   # srip:<F>:<宽>x<高>:<锐化>:<合成方式>[:<投帧率>]
+    if p[0] == "srip" and len(p) in (5, 6, 7) and "x" in p[2]:   # srip:<F>:<宽>x<高>:<锐化>:<合成方式>[:<投帧率>[:键=值,...]]
+        tune = dict(kv.split("=", 1) for kv in p[6].split(",")) if len(p) == 7 and p[6] else {}
+        if any(k not in IP_TUNE for k in tune):
+            raise argparse.ArgumentTypeError(f"srip 臂的插帧参数只认: {IP_TUNE}")
         return {"kind": "srip", "downscale": float(p[1]), "selfsr": f"{p[2]}:{p[3]}", "interp": p[4],
-                "fps": p[5] if len(p) == 6 else ""}
+                "fps": p[5] if len(p) >= 6 else "", "tune": tune}
     if p[0] == "sr" and len(p) in (3, 4, 5) and "x" in p[2]:   # sr:<F>:<宽>x<高>[:<锐化>[:algo=cr,direct=1]]
         opts = dict(kv.split("=", 1) for kv in p[4].split(",")) if len(p) == 5 and p[4] else {}
         if any(k not in SR_OPTS for k in opts):
@@ -190,10 +193,13 @@ def interp_window(dev, a, name, out, t0, t1):
                 rows.append((int(f[7]), f[2]))
             except ValueError:
                 pass
-    if t0 is None or t1 is None:
-        return {"status": "no_clock"}
-    win = sorted(r for r in rows if t0 <= r[0] <= t1)
-    span = (t1 - t0) / 1e9
+    # /proc/uptime 是 BOOTTIME, 层的时刻是 CLOCK_MONOTONIC (差了累计休眠), 对不齐;
+    # 改为以 CSV 里最后一条上屏时刻为终点往前取一个测量窗口 (CSV 在测量结束后才拉, 每 64 行落一次盘)
+    if not rows:
+        return {"status": "no_rows"}
+    end = max(r[0] for r in rows)
+    span = (t1 - t0) / 1e9 if (t0 and t1 and t1 > t0) else float(a.window)
+    win = sorted(r for r in rows if end - span * 1e9 <= r[0] <= end)
     if len(win) < 2:
         return {"status": "no_samples", "rows": len(rows)}
     iv = [(b[0] - a_[0]) / 1e6 for a_, b in zip(win, win[1:])]
