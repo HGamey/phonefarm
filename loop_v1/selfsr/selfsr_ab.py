@@ -35,7 +35,8 @@ SR_PROP = "debug.knobs.selfsr"
 # 截图 (2688x1216) 右上角那排固定图标: 整屏锐度被场景主导 (冷启动后角色/镜头可能不同), 这块内容各臂相同
 HUD_BOX = (1760, 10, 2600, 130)
 IP_PROPS = ("debug.knobs.interp", "debug.knobs.interp_mode", "debug.knobs.interp_fps")
-IP_TUNE = ("pacing", "stamp", "acquire_ms", "extra_images", "lead_ns", "mult", "panel")   # panel 不是层属性, 见 prepare   # ip 臂第 4 段可设的 debug.knobs.interp_<键>
+IP_TUNE = ("pacing", "stamp", "acquire_ms", "extra_images", "lead_ns", "mult", "panel", "framepacing")
+FP_PROP = "vendor.perf.framepacing.enable"   # 高通 perf HAL 的游戏帧节奏; framepacing=<值> 进世界后设, 收尾写回原值   # panel 不是层属性, 见 prepare   # ip 臂第 4 段可设的 debug.knobs.interp_<键>
 
 
 def parse_kind(s):
@@ -190,6 +191,8 @@ def restore_panel(dev):
     for key in PANEL_KEYS:
         v = orig.get(key)
         dev.shell(f"settings delete system {key}" if v in (None, "null") else f"settings put system {key} {v}")
+    if orig.get(FP_PROP) not in (None, "") and dev.prop(FP_PROP) != orig[FP_PROP]:
+        dev.su(f"setprop {FP_PROP} {shlex.quote(orig[FP_PROP])}")
 
 
 def prepare(a, k, orig_mode):
@@ -202,7 +205,7 @@ def prepare(a, k, orig_mode):
     dev.su(f"setprop {IP_PROPS[0]} {'1' if mode else shlex.quote('')}; setprop {IP_PROPS[1]} {shlex.quote(mode or '')}; "
            f"setprop {IP_PROPS[2]} {shlex.quote(k.get('fps') or '')}")
     tune = k.get("tune") or {}
-    dev.su("; ".join(f"setprop debug.knobs.interp_{t} {shlex.quote(str(tune.get(t, '')))}" for t in IP_TUNE if t != "panel"))
+    dev.su("; ".join(f"setprop debug.knobs.interp_{t} {shlex.quote(str(tune.get(t, '')))}" for t in IP_TUNE if t not in ("panel", "framepacing")))
     # panel=<Hz>: 屏幕刷新率 (红魔 refresh_rate_mode), 收尾 (restore) 按开跑前记下的原值写回
     # 刷新率在进世界之后才设 (arm_layer): 原神启动时游戏助手会把它压回 60 Hz
     restore_panel(dev)
@@ -266,6 +269,10 @@ def arm_layer(a, out, name, k, note, locked):
             if not m or abs(float(m.group(1)) - float(panel)) > 3:
                 rec["error"] = f"屏幕没切到 {panel} Hz: {per.strip()}"
                 return rec
+        fpv = (k.get("tune") or {}).get("framepacing")
+        if fpv is not None:   # 进世界后设高通帧节奏开关, 回读核对
+            dev.su(f"setprop {FP_PROP} {shlex.quote(str(fpv))}")
+            rec["framepacing_now"] = dev.prop(FP_PROP)
         time.sleep(a.settle)
         code, s = pf_json(a.phonefarm, "gray-layer", "session-status", "--out", sdir, "--json")
         if proc.poll() is not None or s.get("phase") != "ready":
@@ -358,7 +365,7 @@ def main():
             gm = game_mode(dev, a.pkg, None, a.orig_mode)
             dev.su(f"setprop {SR_PROP} ''")
             dev.su("; ".join(f"setprop {p} ''" for p in IP_PROPS))
-            dev.su("; ".join(f"setprop debug.knobs.interp_{t} ''" for t in IP_TUNE if t != "panel"))
+            dev.su("; ".join(f"setprop debug.knobs.interp_{t} ''" for t in IP_TUNE if t not in ("panel", "framepacing")))
             restore_panel(dev)
             rec = {"game_mode": gm, "mode_now": current_mode(dev, a.pkg), "selfsr_prop": dev.prop(SR_PROP),
                    "interp_props": [dev.prop(p) for p in IP_PROPS]}
@@ -401,7 +408,8 @@ def main():
     orig_cfg = dev.shell(f"cmd game list-configs {a.pkg}")
     orig_sr = dev.prop(SR_PROP)
     orig_timeout = dev.shell("settings get system screen_off_timeout").strip()
-    json.dump({key: dev.shell(f"settings get system {key}").strip() for key in PANEL_KEYS}, open(PANEL_ORIG["path"], "w"))
+    json.dump({**{key: dev.shell(f"settings get system {key}").strip() for key in PANEL_KEYS}, FP_PROP: dev.prop(FP_PROP)},
+              open(PANEL_ORIG["path"], "w"))
     json.dump({"game_mode": orig_mode, "game_configs": orig_cfg, "selfsr_prop": orig_sr,
                "screen_off_timeout": orig_timeout}, open(os.path.join(out, "orig.json"), "w"), ensure_ascii=False)
     if "no intervention" not in orig_cfg.lower() and "downscale" in orig_cfg.lower():
