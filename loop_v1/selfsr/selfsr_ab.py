@@ -10,6 +10,7 @@
   ip:<合成方式>[:<帧率>[:键=值,...]]  挂层并开层内插帧 (interp_mode=dup/dupcur/bm/real, interp_fps=给窗口投的帧率,
                       可选 pacing/stamp/acquire_ms/extra_images/lead_ns → debug.knobs.interp_<键>)
   srip:<F>:<宽>x<高>:<锐化>:<合成方式>[:<帧率>]  超分 + 插帧叠加 (第 5 步)
+  <挂层的臂>+gfrc:<三位>  自研层与 G-FRC+ 同开 (例 sr:1:2688x1216:0.8+gfrc:001)
   gfrc:<三位>          厂商 G-FRC+ (game_gfrc_mode 本包位, 例 101 = 只超分, 111 = 超分+插帧), 对标用
   sr:<F>:<宽>x<高>[:<锐化>]  同上降分辨率 F, 再挂层并设 debug.knobs.selfsr=<宽>x<高>[:<锐化>]: 层在送显前把游戏的小图超分到 <宽>x<高>
 每臂: (devlock 下) 设好 Game Mode 与 selfsr 属性 → 冷启动进大世界 → 静置 --settle 秒 → --window 秒窗口并行采
@@ -44,6 +45,12 @@ FP_PROP = "vendor.perf.framepacing.enable"   # 高通 perf HAL 的游戏帧节�
 
 
 def parse_kind(s):
+    if "+gfrc:" in s:   # <挂层的臂>+gfrc:<三位>  自研层 + 厂商 G-FRC+ 同时开 (G-FRC+ 开着时系统放开限帧)
+        base, bits = s.rsplit("+gfrc:", 1)
+        k = parse_kind(base)
+        if not uses_layer(k) or len(bits) != 3 or not bits.isdigit():
+            raise argparse.ArgumentTypeError(f"+gfrc 只接在挂层的臂后面, 三位数字: {s}")
+        return {**k, "gfrc": bits}
     p = s.split(":")
     if p[0] in ("native", "layer") and len(p) == 1:
         return {"kind": p[0], "downscale": None, "selfsr": None}
