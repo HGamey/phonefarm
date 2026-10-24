@@ -2,7 +2,7 @@
 // selfsr_fused.comp — selfsr_up.comp (Lanczos2 + 2x2 去振铃) 与 selfsr_rcas.comp (RCAS) 合成一个 pass:
 // 每个 16x16 工作组先把它要输出的 16x16 加一圈 (18x18) 的放大结果算进共享内存, 再在共享内存上做 RCAS 写出,
 // 省掉中间整张图的写出与读回。图像边缘与两遍版一致 (RCAS 的邻域夹在 [0, out_size-1])。
-// 契约: binding 0 = 只读源 (combined sampler, 只用 texelFetch), binding 1 = 只写目标, 工作组 16x16。
+// 契约: binding 0 = 只读源 (combined sampler; lanczos 只用 texelFetch, cr 用线性采样), binding 1 = 只写目标, 工作组 16x16。
 layout(local_size_x = 16, local_size_y = 16) in;
 layout(binding = 0) uniform sampler2D src;
 layout(binding = 1, rgba8) uniform writeonly image2D dst;
@@ -10,6 +10,7 @@ layout(push_constant) uniform PC {
     ivec2 in_size;
     ivec2 out_size;
     float sharp;
+    int algo;   // 0 = Lanczos2 (16 次 texelFetch + 2x2 去振铃), 1 = Catmull-Rom (9 次硬件双线性取样, 不算 sin)
 } pc;
 
 shared vec3 tile[18][18];
@@ -47,12 +48,37 @@ vec3 upscale(ivec2 o) {
     return clamp(acc / wsum, lo, hi);
 }
 
+// Catmull-Rom 双三次: 4x4 权重合并成 3x3 次双线性取样 (中间两列/行权重相加, 偏移落在两纹素之间)
+vec3 upscale_cr(ivec2 o) {
+    vec2 inv = 1.0 / vec2(pc.in_size);
+    vec2 sp = (vec2(o) + 0.5) * vec2(pc.in_size) / vec2(pc.out_size);
+    vec2 tp1 = floor(sp - 0.5) + 0.5;
+    vec2 f = sp - tp1;
+    vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    vec2 w3 = f * f * (-0.5 + 0.5 * f);
+    vec2 w12 = w1 + w2;
+    vec2 t0 = (tp1 - 1.0) * inv, t3 = (tp1 + 2.0) * inv, t12 = (tp1 + w2 / w12) * inv;
+    vec3 r = textureLod(src, vec2(t0.x, t0.y), 0.0).rgb * w0.x * w0.y
+           + textureLod(src, vec2(t12.x, t0.y), 0.0).rgb * w12.x * w0.y
+           + textureLod(src, vec2(t3.x, t0.y), 0.0).rgb * w3.x * w0.y
+           + textureLod(src, vec2(t0.x, t12.y), 0.0).rgb * w0.x * w12.y
+           + textureLod(src, vec2(t12.x, t12.y), 0.0).rgb * w12.x * w12.y
+           + textureLod(src, vec2(t3.x, t12.y), 0.0).rgb * w3.x * w12.y
+           + textureLod(src, vec2(t0.x, t3.y), 0.0).rgb * w0.x * w3.y
+           + textureLod(src, vec2(t12.x, t3.y), 0.0).rgb * w12.x * w3.y
+           + textureLod(src, vec2(t3.x, t3.y), 0.0).rgb * w3.x * w3.y;
+    return clamp(r, 0.0, 1.0);
+}
+
 void main() {
     ivec2 base = ivec2(gl_WorkGroupID.xy) * 16 - 1;   // tile[0][0] 对应的输出坐标
     uint lid = gl_LocalInvocationIndex;
     for (uint k = lid; k < 18u * 18u; k += 256u) {
         ivec2 t = ivec2(int(k % 18u), int(k / 18u));
-        tile[t.y][t.x] = upscale(clamp(base + t, ivec2(0), pc.out_size - 1));
+        ivec2 q = clamp(base + t, ivec2(0), pc.out_size - 1);
+        tile[t.y][t.x] = pc.algo == 1 ? upscale_cr(q) : upscale(q);
     }
     barrier();
     ivec2 o = ivec2(gl_GlobalInvocationID.xy);

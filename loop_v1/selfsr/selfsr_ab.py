@@ -32,6 +32,7 @@ from gfrc_ab import Dev, parse_timestats, layer_src, sharpness, signflip, boot_c
 PKG_DEFAULT = "com.miHoYo.Yuanshen"
 DEV_TRACE = "/data/local/tmp/selfsr_ftrace_capture.sh"
 SR_PROP = "debug.knobs.selfsr"
+SR_OPTS = ("algo", "direct")   # → debug.knobs.selfsr_<键>
 # 截图 (2688x1216) 右上角那排固定图标: 整屏锐度被场景主导 (冷启动后角色/镜头可能不同), 这块内容各臂相同
 HUD_BOX = (1760, 10, 2600, 130)
 IP_PROPS = ("debug.knobs.interp", "debug.knobs.interp_mode", "debug.knobs.interp_fps")
@@ -54,8 +55,11 @@ def parse_kind(s):
     if p[0] == "srip" and len(p) in (5, 6) and "x" in p[2]:   # srip:<F>:<宽>x<高>:<锐化>:<合成方式>[:<投帧率>]
         return {"kind": "srip", "downscale": float(p[1]), "selfsr": f"{p[2]}:{p[3]}", "interp": p[4],
                 "fps": p[5] if len(p) == 6 else ""}
-    if p[0] == "sr" and len(p) in (3, 4) and "x" in p[2]:   # sr:<F>:<宽>x<高>[:<锐化>]
-        return {"kind": "sr", "downscale": float(p[1]), "selfsr": ":".join(p[2:])}
+    if p[0] == "sr" and len(p) in (3, 4, 5) and "x" in p[2]:   # sr:<F>:<宽>x<高>[:<锐化>[:algo=cr,direct=1]]
+        opts = dict(kv.split("=", 1) for kv in p[4].split(",")) if len(p) == 5 and p[4] else {}
+        if any(k not in SR_OPTS for k in opts):
+            raise argparse.ArgumentTypeError(f"sr 臂只认这些键: {SR_OPTS}")
+        return {"kind": "sr", "downscale": float(p[1]), "selfsr": ":".join(p[2:4]), "sr_opts": opts}
     raise argparse.ArgumentTypeError(f"不认识的臂: {s}")
 
 
@@ -201,6 +205,8 @@ def prepare(a, k, orig_mode):
     dev.shell(f"am force-stop {a.pkg}")
     gm = game_mode(dev, a.pkg, k["downscale"], orig_mode)
     dev.su(f"setprop {SR_PROP} {shlex.quote(k['selfsr'] or '')}")
+    so = k.get("sr_opts") or {}
+    dev.su("; ".join(f"setprop debug.knobs.selfsr_{o} {shlex.quote(so.get(o, ''))}" for o in SR_OPTS))
     mode = k.get("interp")
     dev.su(f"setprop {IP_PROPS[0]} {'1' if mode else shlex.quote('')}; setprop {IP_PROPS[1]} {shlex.quote(mode or '')}; "
            f"setprop {IP_PROPS[2]} {shlex.quote(k.get('fps') or '')}")
@@ -364,6 +370,7 @@ def main():
             dev.shell(f"am force-stop {a.pkg}")
             gm = game_mode(dev, a.pkg, None, a.orig_mode)
             dev.su(f"setprop {SR_PROP} ''")
+            dev.su("; ".join(f"setprop debug.knobs.selfsr_{o} ''" for o in SR_OPTS))
             dev.su("; ".join(f"setprop {p} ''" for p in IP_PROPS))
             dev.su("; ".join(f"setprop debug.knobs.interp_{t} ''" for t in IP_TUNE if t not in ("panel", "framepacing")))
             restore_panel(dev)

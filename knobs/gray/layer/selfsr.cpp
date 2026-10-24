@@ -68,6 +68,7 @@ struct Slot {
     VkCommandBuffer cb = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
     bool busy = false;
+    bool timed = false;   // 这个槽上次提交带了 GPU 时间戳 (查询号 2*i, 2*i+1)
 };
 
 struct Dev {
@@ -87,6 +88,8 @@ struct Dev {
     SR_FN(DestroyDescriptorPool) SR_FN(AllocateDescriptorSets) SR_FN(FreeDescriptorSets) SR_FN(UpdateDescriptorSets)
     SR_FN(CreatePipelineLayout) SR_FN(DestroyPipelineLayout) SR_FN(CreateShaderModule) SR_FN(DestroyShaderModule)
     SR_FN(CreateComputePipelines) SR_FN(DestroyPipeline) SR_FN(DeviceWaitIdle) SR_FN(DestroySwapchainKHR)
+    SR_FN(CreateQueryPool) SR_FN(DestroyQueryPool) SR_FN(CmdResetQueryPool) SR_FN(CmdWriteTimestamp) SR_FN(GetQueryPoolResults)
+    SR_FN(GetPhysicalDeviceProperties)
     SR_FN(GetPhysicalDeviceMemoryProperties) SR_FN(GetPhysicalDeviceSurfaceCapabilitiesKHR)
     SR_FN(GetPhysicalDeviceFormatProperties)
 #undef SR_FN
@@ -100,6 +103,8 @@ struct Dev {
     VkPipelineLayout pl = VK_NULL_HANDLE;
     VkPipeline pipe = VK_NULL_HANDLE, pipe_rcas = VK_NULL_HANDLE;
     bool fused = false;   // pipe 是 selfsr_fused.comp (放大 + RCAS 一个 pass)
+    VkQueryPool qpool = VK_NULL_HANDLE;   // 6 个时间戳 (3 个槽 x 前后), 量层自己的 GPU 耗时
+    float ts_period_ns = 0.f;
     bool pipe_tried = false;
     std::map<VkSwapchainKHR, Swap> swaps;
     std::vector<VkSemaphore> retired_sems;
@@ -109,6 +114,9 @@ std::mutex g_m;
 bool g_on = false;
 uint32_t g_want_w = 0, g_want_h = 0;
 float g_sharp = 0.f;                        // RCAS 强度, 0 = 不锐化
+int g_algo = 0;                             // debug.knobs.selfsr_algo: 0 = lanczos (Lanczos2 4x4), 1 = cr (Catmull-Rom 9 次双线性取样)
+bool g_direct_ok = false;                   // debug.knobs.selfsr_direct=1 才直写 swapchain (加 STORAGE 用途可能关掉 UBWC 压缩)
+std::vector<uint64_t> g_gpu_us;             // 层自己的命令在 GPU 上的耗时 (时间戳差, 最近 1024 个)
 std::map<void*, Dev*> g_devs;
 std::string g_reason;                       // 最近一次没能启用的原因
 uint64_t g_up = 0, g_passthrough = 0, g_same_size = 0, g_direct_frames = 0;
@@ -168,8 +176,12 @@ bool ensure_pipeline(Dev* D) {
         VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         if (D->CreateFence(D->dev, &fci, nullptr, &s.fence) != VK_SUCCESS) { g_reason = "fence"; return false; }
     }
+    if (D->CreateQueryPool && D->ts_period_ns > 0) {
+        VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, nullptr, 0, VK_QUERY_TYPE_TIMESTAMP, 6, 0};
+        if (D->CreateQueryPool(D->dev, &qci, nullptr, &D->qpool) != VK_SUCCESS) D->qpool = VK_NULL_HANDLE;
+    }
     VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-    sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
+    sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;   // texelFetch 不受影响; cr 算法靠硬件双线性取样
     sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     if (D->CreateSampler(D->dev, &sci, nullptr, &D->sampler) != VK_SUCCESS) { g_reason = "sampler"; return false; }
     VkDescriptorSetLayoutBinding b[2] = {
@@ -267,7 +279,12 @@ bool sr_init_from_props() {
     if (n >= 2 && w >= 64 && h >= 64 && w <= 4096 && h <= 4096) {
         g_on = true; g_want_w = w; g_want_h = h;
         g_sharp = (n == 3 && sharp > 0.f) ? (sharp > 1.f ? 1.f : sharp) : 0.f;
-        SR_LOG("开启: 送显分辨率 %ux%u 锐化 %.2f", w, h, g_sharp);
+        char a[PROP_VALUE_MAX] = {0}, d[PROP_VALUE_MAX] = {0};
+        __system_property_get("debug.knobs.selfsr_algo", a);
+        __system_property_get("debug.knobs.selfsr_direct", d);
+        g_algo = !strcmp(a, "cr") ? 1 : 0;
+        g_direct_ok = d[0] == '1';
+        SR_LOG("开启: 送显分辨率 %ux%u 锐化 %.2f 算法 %s 直写 %d", w, h, g_sharp, g_algo ? "cr" : "lanczos", (int)g_direct_ok);
     }
     return g_on;
 }
@@ -291,11 +308,18 @@ void sr_on_device(VkInstance inst, VkPhysicalDevice phys, VkDevice dev, PFN_vkGe
     SR_GD(DestroyDescriptorPool) SR_GD(AllocateDescriptorSets) SR_GD(FreeDescriptorSets) SR_GD(UpdateDescriptorSets)
     SR_GD(CreatePipelineLayout) SR_GD(DestroyPipelineLayout) SR_GD(CreateShaderModule) SR_GD(DestroyShaderModule)
     SR_GD(CreateComputePipelines) SR_GD(DestroyPipeline) SR_GD(DeviceWaitIdle) SR_GD(DestroySwapchainKHR)
+    SR_GD(CreateQueryPool) SR_GD(DestroyQueryPool) SR_GD(CmdResetQueryPool) SR_GD(CmdWriteTimestamp) SR_GD(GetQueryPoolResults)
 #undef SR_GD
     if (inst && gipa) {
         D->GetPhysicalDeviceMemoryProperties = (PFN_vkGetPhysicalDeviceMemoryProperties)gipa(inst, "vkGetPhysicalDeviceMemoryProperties");
         D->GetPhysicalDeviceSurfaceCapabilitiesKHR = (PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR)gipa(inst, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
         D->GetPhysicalDeviceFormatProperties = (PFN_vkGetPhysicalDeviceFormatProperties)gipa(inst, "vkGetPhysicalDeviceFormatProperties");
+        D->GetPhysicalDeviceProperties = (PFN_vkGetPhysicalDeviceProperties)gipa(inst, "vkGetPhysicalDeviceProperties");
+    }
+    if (D->GetPhysicalDeviceProperties) {
+        VkPhysicalDeviceProperties pp{};
+        D->GetPhysicalDeviceProperties(phys, &pp);
+        D->ts_period_ns = pp.limits.timestampPeriod;
     }
     D->complete = D->GetSwapchainImagesKHR && D->CreateCommandPool && D->AllocateCommandBuffers && D->ResetCommandBuffer &&
                   D->BeginCommandBuffer && D->EndCommandBuffer && D->CmdPipelineBarrier && D->CmdCopyImage &&
@@ -323,6 +347,7 @@ void sr_on_destroy_device(VkDevice dev) {
     for (auto& s : D->slots) if (s.fence) D->DestroyFence(D->dev, s.fence, nullptr);
     if (D->pool) D->DestroyCommandPool(D->dev, D->pool, nullptr);
     if (D->pipe) D->DestroyPipeline(D->dev, D->pipe, nullptr);
+    if (D->qpool) D->DestroyQueryPool(D->dev, D->qpool, nullptr);
     if (D->pipe_rcas) D->DestroyPipeline(D->dev, D->pipe_rcas, nullptr);
     if (D->pl) D->DestroyPipelineLayout(D->dev, D->pl, nullptr);
     if (D->dpool) D->DestroyDescriptorPool(D->dev, D->dpool, nullptr);
@@ -358,7 +383,7 @@ bool sr_patch_swapchain_ci(VkDevice dev, VkSwapchainCreateInfoKHR* ci) {
     // 直写: surface 给 STORAGE、格式是 UNORM (SRGB 图不能直接当 rgba8 storage 写) 就要上
     VkFormatProperties fp{};
     D->GetPhysicalDeviceFormatProperties(D->phys, VK_FORMAT_R8G8B8A8_UNORM, &fp);
-    if ((caps.supportedUsageFlags & VK_IMAGE_USAGE_STORAGE_BIT) && ci->imageFormat == VK_FORMAT_R8G8B8A8_UNORM &&
+    if (g_direct_ok && (caps.supportedUsageFlags & VK_IMAGE_USAGE_STORAGE_BIT) && ci->imageFormat == VK_FORMAT_R8G8B8A8_UNORM &&
         (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT))
         ci->imageUsage |= VK_IMAGE_USAGE_STORAGE_BIT;
     return true;
@@ -451,9 +476,18 @@ VkResult sr_on_present(VkQueue q, const VkPresentInfoKHR* pi, PFN_vkQueuePresent
     uint32_t idx = pi->pImageIndices[0];
     if (idx >= S.imgs.size() || !S.sems[idx]) return bail("image_index");
     Slot& sl = D->slots[D->next_slot % 3];
+    const uint32_t si_ = (uint32_t)(D->next_slot % 3);
     if (sl.busy) {
         if (D->WaitForFences(D->dev, 1, &sl.fence, VK_TRUE, 2000000ull) != VK_SUCCESS) return bail("slot_busy");
         sl.busy = false;
+    }
+    if (sl.timed && D->qpool) {   // 上次这个槽的两个时间戳 (fence 已过, 结果可读)
+        uint64_t ts[2] = {0, 0};
+        if (D->GetQueryPoolResults(D->dev, D->qpool, si_ * 2, 2, sizeof ts, ts, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ts[1] > ts[0]) {
+            uint64_t us = (uint64_t)((double)(ts[1] - ts[0]) * D->ts_period_ns / 1000.0);
+            if (g_gpu_us.size() < 1024) g_gpu_us.push_back(us); else g_gpu_us[g_up % 1024] = us;
+        }
+        sl.timed = false;
     }
     VkImage N = S.imgs[idx];
     VkCommandBuffer cb = sl.cb;
@@ -466,6 +500,10 @@ VkResult sr_on_present(VkQueue q, const VkPresentInfoKHR* pi, PFN_vkQueuePresent
                        VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
                        VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
     D->CmdPipelineBarrier(cb, TR | CS, TR | CS, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    if (D->qpool) {
+        D->CmdResetQueryPool(cb, D->qpool, si_ * 2, 2);
+        D->CmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, D->qpool, si_ * 2);
+    }
     barrier(D, cb, N, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 0, VK_ACCESS_TRANSFER_READ_BIT, TR, TR);
     barrier(D, cb, S.T, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT, TR, TR);
     VkImageCopy rg{};
@@ -473,8 +511,8 @@ VkResult sr_on_present(VkQueue q, const VkPresentInfoKHR* pi, PFN_vkQueuePresent
     rg.extent = {S.in_w, S.in_h, 1};
     D->CmdCopyImage(cb, N, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, S.T, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rg);
     barrier(D, cb, S.T, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, TR, CS);
-    struct { int32_t iw, ih, ow, oh; float sharp; int32_t pad[3]; } pc{(int32_t)S.in_w, (int32_t)S.in_h, (int32_t)S.out_w,
-                                                                       (int32_t)S.out_h, g_sharp, {0, 0, 0}};
+    struct { int32_t iw, ih, ow, oh; float sharp; int32_t algo; int32_t pad[2]; } pc{(int32_t)S.in_w, (int32_t)S.in_h,
+        (int32_t)S.out_w, (int32_t)S.out_h, g_sharp, g_algo, {0, 0}};
     const bool direct = S.direct && idx < S.dsets.size() && S.dsets[idx];
     if (direct) {   // 融合着色器直接写 swapchain 图: N 读完左上角后转 GENERAL 给计算着色器写
         barrier(D, cb, N, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT, TR, CS);
@@ -510,6 +548,7 @@ VkResult sr_on_present(VkQueue q, const VkPresentInfoKHR* pi, PFN_vkQueuePresent
     D->CmdCopyImage(cb, R, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, N, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &full);
     barrier(D, cb, N, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_WRITE_BIT, 0, TR, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
     }
+    if (D->qpool) D->CmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, D->qpool, si_ * 2 + 1);
     D->EndCommandBuffer(cb);
     std::vector<VkPipelineStageFlags> stages(pi->waitSemaphoreCount, TR);
     VkSubmitInfo sub{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -523,6 +562,7 @@ VkResult sr_on_present(VkQueue q, const VkPresentInfoKHR* pi, PFN_vkQueuePresent
         return bail("submit_fail");
     }
     sl.busy = true;
+    sl.timed = D->qpool != VK_NULL_HANDLE;
     D->next_slot++;
     S.frames++;
     g_up++;
@@ -540,6 +580,9 @@ std::string sr_json() {
     std::lock_guard<std::mutex> lk(g_m);
     std::string fb;
     for (auto& kv : g_fb) fb += (fb.empty() ? "" : ",") + ("\"" + kv.first + "\":" + std::to_string(kv.second));
+    std::vector<uint64_t> gg = g_gpu_us;
+    std::sort(gg.begin(), gg.end());
+    auto gp = [&](double p) -> unsigned long long { return gg.empty() ? 0 : gg[(size_t)(p * (gg.size() - 1) + 0.5)]; };
     std::vector<uint64_t> c = g_cpu_us;
     std::sort(c.begin(), c.end());
     auto pct = [&](double p) -> unsigned long long { return c.empty() ? 0 : c[(size_t)(p * (c.size() - 1) + 0.5)]; };
@@ -549,5 +592,8 @@ std::string sr_json() {
              "\"passthrough\":%llu,\"direct_frames\":%llu,\"reason\":\"%s\",\"cpu_us_p50\":%llu,\"cpu_us_p95\":%llu,\"fallbacks\":{",
              g_want_w, g_want_h, g_sharp, g_last_in_w, g_last_in_h, g_last_out_w, g_last_out_h, (unsigned long long)g_up,
              (unsigned long long)g_same_size, (unsigned long long)g_passthrough, (unsigned long long)g_direct_frames, g_reason.c_str(), pct(0.5), pct(0.95));
-    return std::string(b) + fb + "}}";
+    char g2[160];
+    snprintf(g2, sizeof g2, ",\"gpu_us_p50\":%llu,\"gpu_us_p95\":%llu,\"gpu_samples\":%zu,\"algo\":\"%s\"", gp(0.5), gp(0.95),
+             gg.size(), g_algo ? "cr" : "lanczos");
+    return std::string(b) + fb + "}" + g2 + "}";
 }
