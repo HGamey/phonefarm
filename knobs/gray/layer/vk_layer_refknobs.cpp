@@ -17,6 +17,7 @@
 #include <vulkan/vulkan.h>
 #include <android/log.h>
 #include <atomic>
+#include <dlfcn.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -670,6 +671,35 @@ static bool read_bool_prop(const char* name) {
     return v[0] == '1' || v[0] == 't' || v[0] == 'y';
 }
 
+// unlimit (debug.knobs.unlimit=1): 解开红魔 libgui 的进程内限帧。
+// RedMagicOS 11 的 libgui.so: Surface::queueBuffer → Surface::limitedFpsIfNeeded() 读
+// FpsControlConfig::getGlobalConfig() 偏移 0x60 的 int (1..253 时按 1/N 秒睡眠补齐), BLASTBufferQueue 也用它同步
+// 生产者的 setLimitedFps 并随帧元数据发给 SF。系统服务按温度下发 (真机过热 30, 凉 60)。每次送显前把它清零。
+// 只对这个版本的偏移有效: 取到的配置指针为空或 libgui 里没有该符号时什么都不做, 原因记进 marker。
+static bool g_unlimit = false;
+static std::atomic<uint64_t> g_unlimit_cleared{0};
+static std::atomic<int> g_unlimit_seen{-1};
+static std::string g_unlimit_reason;
+static void* (*g_fps_cfg_get)() = nullptr;
+static void unlimit_init() {
+    g_unlimit = read_bool_prop("debug.knobs.unlimit");
+    if (!g_unlimit) return;
+    void* h = dlopen("libgui.so", RTLD_NOW | RTLD_NOLOAD);
+    if (!h) h = dlopen("libgui.so", RTLD_NOW);
+    if (h) g_fps_cfg_get = reinterpret_cast<void* (*)()>(dlsym(h, "_ZN7android16FpsControlConfig15getGlobalConfigEv"));
+    if (!g_fps_cfg_get) g_unlimit_reason = "no_FpsControlConfig";
+    __android_log_print(ANDROID_LOG_INFO, "refknobs", "unlimit=1: FpsControlConfig::getGlobalConfig %s", g_fps_cfg_get ? "找到" : "没有");
+}
+static void unlimit_on_present() {
+    if (!g_fps_cfg_get) return;
+    char* cfg = static_cast<char*>(g_fps_cfg_get());
+    if (!cfg) return;
+    int* lim = reinterpret_cast<int*>(cfg + 0x60);
+    int v = *lim;
+    if (v != 0) { g_unlimit_seen = v; *lim = 0; g_unlimit_cleared++; }
+}
+
+
 // 证据双通道。原本只走文件系统, 因为立项时以为本机 logcat 哑掉 —— 2026-09-23 实测发现
 // logcat 只是对 shell uid 不可读, `su -c logcat` 一切正常 (refbench 与原神都验过)。
 // 文件通道在这两个应用上都能写, 但换个目标应用未必 (存储沙箱/SELinux 各不相同),
@@ -792,6 +822,9 @@ static void write_marker() {
     if (fd_on()) json += ",\"framedump\":" + fd_json();   // 逐帧读回 (framedump.cpp)
     if (ip_on()) json += ",\"interp\":" + ip_json();       // 层内多 present (interp.cpp)
     if (sr_on()) json += ",\"selfsr\":" + sr_json();       // 送显前超分 (selfsr.cpp)
+    if (g_unlimit) json += ",\"unlimit\":{\"symbol\":" + std::string(g_fps_cfg_get ? "true" : "false") + ",\"last_seen\":" +
+                           std::to_string(g_unlimit_seen.load()) + ",\"cleared\":" + std::to_string(g_unlimit_cleared.load()) +
+                           ",\"reason\":\"" + g_unlimit_reason + "\"}";
     json += "}";
 
     // 通道 1: logcat (root 可读, 不受目标应用存储沙箱影响)。
@@ -890,6 +923,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL rk_CreateInstance(
     if (fd_init_from_props()) RK_LOG("framedump=1: present 处逐帧读回 (framedump.cpp)");
     if (ip_init_from_props()) RK_LOG("interp=1: 层内多 present, 两帧之间插一张合成帧 (interp.cpp)");
     if (sr_init_from_props()) RK_LOG("selfsr: 送显前超分 (selfsr.cpp)");
+    unlimit_init();
     RK_LOG("rk_CreateInstance entered (pkg=%s) rewrite_loadop=%d passdump=%d copyprobe=%d upop=%d frameaudit=%d ts=%d",
            self_pkg().c_str(), (int)g_rewrite_loadop, (int)g_dump_passes, (int)g_copyprobe, (int)g_upop,
            (int)g_frameaudit, (int)g_frameaudit_ts);
@@ -3729,6 +3763,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL rk_QueuePresentKHR(VkQueue q, const VkPres
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     uint64_t f = ++g_frames;
+    if (g_unlimit) unlimit_on_present();
     if (g_storeop_live && f % 30 == 0) {
         bool on = read_bool_prop("debug.knobs.storeop_on");
         if (on != g_storeop_on.exchange(on)) RK_LOG("storeop 现场切换: %s (frame=%llu)", on ? "开" : "关", (unsigned long long)f);

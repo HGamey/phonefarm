@@ -33,11 +33,13 @@ from gfrc_ab import Dev, parse_timestats, layer_src, sharpness, signflip, boot_c
 PKG_DEFAULT = "com.miHoYo.Yuanshen"
 DEV_TRACE = "/data/local/tmp/selfsr_ftrace_capture.sh"
 SR_PROP = "debug.knobs.selfsr"
-SR_OPTS = ("algo", "direct")   # → debug.knobs.selfsr_<键>
+SR_OPTS = ("algo", "direct", "unlimit")   # → debug.knobs.selfsr_<键>; unlimit → debug.knobs.unlimit
+UNLIMIT_PROP = "debug.knobs.unlimit"
 # 截图 (2688x1216) 右上角那排固定图标: 整屏锐度被场景主导 (冷启动后角色/镜头可能不同), 这块内容各臂相同
 HUD_BOX = (1760, 10, 2600, 130)
 IP_PROPS = ("debug.knobs.interp", "debug.knobs.interp_mode", "debug.knobs.interp_fps")
-IP_TUNE = ("pacing", "stamp", "acquire_ms", "extra_images", "lead_ns", "mult", "backend", "sc_dst", "panel", "framepacing")
+IP_TUNE = ("pacing", "stamp", "acquire_ms", "extra_images", "lead_ns", "mult", "backend", "sc_dst", "panel", "framepacing",
+           "unlimit")
 FP_PROP = "vendor.perf.framepacing.enable"   # 高通 perf HAL 的游戏帧节奏; framepacing=<值> 进世界后设, 收尾写回原值   # panel 不是层属性, 见 prepare   # ip 臂第 4 段可设的 debug.knobs.interp_<键>
 
 
@@ -45,6 +47,8 @@ def parse_kind(s):
     p = s.split(":")
     if p[0] in ("native", "layer") and len(p) == 1:
         return {"kind": p[0], "downscale": None, "selfsr": None}
+    if p[0] == "layer" and len(p) == 2 and p[1] == "unlimit=1":   # 透传层 + 解开红魔 libgui 进程内限帧
+        return {"kind": "layer", "downscale": None, "selfsr": None, "unlimit": True}
     if p[0] == "gfrc" and len(p) == 2 and len(p[1]) == 3:   # gfrc:<画质档><帧率档><总开关>  厂商 G-FRC+ (对标用)
         return {"kind": "gfrc", "downscale": None, "selfsr": None, "gfrc": p[1]}
     if p[0] == "ip" and len(p) in (2, 3, 4):   # ip:<合成方式>[:<投帧率>[:键=值,...]]  层内插帧 (interp.cpp)
@@ -277,12 +281,14 @@ def prepare(a, k, orig_mode):
         # 先一律关; G-FRC+ 要在进世界之后再开才生效 (见 arm_plain)
         dev.shell(f"settings put global game_gfrc_mode {shlex.quote(set_pkg_bits(cur, a.pkg, '000'))}")
     so = k.get("sr_opts") or {}
-    dev.su("; ".join(f"setprop debug.knobs.selfsr_{o} {shlex.quote(so.get(o, ''))}" for o in SR_OPTS))
+    dev.su("; ".join(f"setprop debug.knobs.selfsr_{o} {shlex.quote(so.get(o, ''))}" for o in SR_OPTS if o != "unlimit"))
+    unl = k.get("unlimit") or so.get("unlimit") == "1" or (k.get("tune") or {}).get("unlimit") == "1"
+    dev.su(f"setprop {UNLIMIT_PROP} {'1' if unl else shlex.quote('')}")
     mode = k.get("interp")
     dev.su(f"setprop {IP_PROPS[0]} {'1' if mode else shlex.quote('')}; setprop {IP_PROPS[1]} {shlex.quote(mode or '')}; "
            f"setprop {IP_PROPS[2]} {shlex.quote(k.get('fps') or '')}")
     tune = k.get("tune") or {}
-    dev.su("; ".join(f"setprop debug.knobs.interp_{t} {shlex.quote(str(tune.get(t, '')))}" for t in IP_TUNE if t not in ("panel", "framepacing")))
+    dev.su("; ".join(f"setprop debug.knobs.interp_{t} {shlex.quote(str(tune.get(t, '')))}" for t in IP_TUNE if t not in ("panel", "framepacing", "unlimit")))
     # panel=<Hz>: 屏幕刷新率 (红魔 refresh_rate_mode), 收尾 (restore) 按开跑前记下的原值写回
     # 刷新率在进世界之后才设 (arm_layer): 原神启动时游戏助手会把它压回 60 Hz
     restore_panel(dev)
@@ -395,6 +401,7 @@ def arm_layer(a, out, name, k, note, locked):
             # 层的 marker 每 300 帧落一次盘, 游戏帧率低时窗口内可能一次没落: 判「在超分」看累计次数
             if (s1.get("upscaled") or 0) <= 0:
                 rec["error"] = f"层没在超分 (selfsr={s1})"
+        rec["unlimit"] = m1.get("unlimit")
         if k["kind"] in ("ip", "srip"):
             ipj = m1.get("interp") or {}
             rec["interp"] = ipj
@@ -459,7 +466,8 @@ def main():
             dev.shell(f"am force-stop {a.pkg}")
             gm = game_mode(dev, a.pkg, None, a.orig_mode)
             dev.su(f"setprop {SR_PROP} ''")
-            dev.su("; ".join(f"setprop debug.knobs.selfsr_{o} ''" for o in SR_OPTS))
+            dev.su("; ".join(f"setprop debug.knobs.selfsr_{o} ''" for o in SR_OPTS if o != "unlimit"))
+            dev.su(f"setprop {UNLIMIT_PROP} ''")
             try:
                 og = json.load(open(os.path.join(out, "orig.json"))).get("game_gfrc_mode")
             except (OSError, ValueError):
@@ -467,7 +475,7 @@ def main():
             if og not in (None, "", "null"):
                 dev.shell(f"settings put global game_gfrc_mode {shlex.quote(og)}")
             dev.su("; ".join(f"setprop {p} ''" for p in IP_PROPS))
-            dev.su("; ".join(f"setprop debug.knobs.interp_{t} ''" for t in IP_TUNE if t not in ("panel", "framepacing")))
+            dev.su("; ".join(f"setprop debug.knobs.interp_{t} ''" for t in IP_TUNE if t not in ("panel", "framepacing", "unlimit")))
             restore_panel(dev)
             rec = {"game_mode": gm, "mode_now": current_mode(dev, a.pkg), "selfsr_prop": dev.prop(SR_PROP),
                    "game_gfrc_mode": dev.shell("settings get global game_gfrc_mode").strip(),
