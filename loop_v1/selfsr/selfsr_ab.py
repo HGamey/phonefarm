@@ -22,7 +22,7 @@
 收尾 (含 Ctrl-C): Game Mode 恢复原模式并 reset 干预、清 debug.knobs.selfsr、screen_off_timeout 还原, 逐项回读核对。
 统计: 每对 (B - A) 配对差, 精确符号翻转检验 + bootstrap 95% 区间。
 """
-import argparse, json, os, shlex, signal, statistics, subprocess, sys, time, uuid
+import argparse, json, os, re, shlex, signal, statistics, subprocess, sys, time, uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
@@ -204,10 +204,8 @@ def prepare(a, k, orig_mode):
     tune = k.get("tune") or {}
     dev.su("; ".join(f"setprop debug.knobs.interp_{t} {shlex.quote(str(tune.get(t, '')))}" for t in IP_TUNE if t != "panel"))
     # panel=<Hz>: 屏幕刷新率 (红魔 refresh_rate_mode), 收尾 (restore) 按开跑前记下的原值写回
-    if tune.get("panel"):
-        dev.shell(f"settings put system refresh_rate_mode {PANEL_MODE[str(tune['panel'])]}")
-    else:
-        restore_panel(dev)
+    # 刷新率在进世界之后才设 (arm_layer): 原神启动时游戏助手会把它压回 60 Hz
+    restore_panel(dev)
     return {"game_mode": gm, "selfsr_prop": dev.prop(SR_PROP), "interp_props": [dev.prop(p) for p in IP_PROPS]}
 
 
@@ -258,6 +256,16 @@ def arm_layer(a, out, name, k, note, locked):
         if code != 0:
             rec["error"] = f"onboard --no-cold: {err}"
             return rec
+        panel = (k.get("tune") or {}).get("panel")
+        if panel:   # 进世界后再设刷新率 (红魔 refresh_rate_mode), 回读 SF 刷新周期确认
+            dev.shell(f"settings put system refresh_rate_mode {PANEL_MODE[str(panel)]}")
+            time.sleep(4)
+            per = dev.shell("dumpsys SurfaceFlinger | grep -m1 mPeriod")
+            rec["panel_period"] = per.strip()
+            m = re.search(r"\(([0-9.]+) fps\)", per)
+            if not m or abs(float(m.group(1)) - float(panel)) > 3:
+                rec["error"] = f"屏幕没切到 {panel} Hz: {per.strip()}"
+                return rec
         time.sleep(a.settle)
         code, s = pf_json(a.phonefarm, "gray-layer", "session-status", "--out", sdir, "--json")
         if proc.poll() is not None or s.get("phase") != "ready":
