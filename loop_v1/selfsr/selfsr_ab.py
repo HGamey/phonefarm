@@ -441,6 +441,7 @@ def main():
     ap.add_argument("--settle", type=float, default=20)
     ap.add_argument("--window", type=int, default=10)
     ap.add_argument("--session-seconds", type=int, default=1200)
+    ap.add_argument("--cool-max", type=float, default=0, help="每臂开跑前电池温度要降到这个 °C 以下 (0 = 不等), 最多等 15 分钟")
     ap.add_argument("--fan", action="store_true", help="整轮开机身风扇最高档 (红魔 /sys/kernel/fan), 收尾写回原值; 没有该节点的机器跳过")
     ap.add_argument("--phonefarm", default=os.environ.get("PHONEFARM_BIN") or os.path.join(REPO, "phonefarm"))
     # _locked 内部用
@@ -564,12 +565,27 @@ def main():
                 break
             k, k_str = (a.a, ka) if arm == "A" else (a.b, kb)
             name = f"{arm}{pair + 1}"
+            cool_wait = 0
+            if a.cool_max > 0:   # 等电池降温 (过热时系统高温保护会弹窗挡前台、限制应用运行)
+                dev.shell(f"am force-stop {a.pkg}; input keyevent KEYCODE_SLEEP")
+                for _ in range(90):
+                    try:
+                        t_c = int(re.search(r"temperature: (\d+)", dev.shell("dumpsys battery")).group(1)) / 10
+                    except (AttributeError, ValueError):
+                        break
+                    if t_c <= a.cool_max:
+                        break
+                    time.sleep(10)
+                    cool_wait += 10
+                if cool_wait:
+                    note(f"{name}: 等降温 {cool_wait}s (电池 ≤ {a.cool_max}°C)")
             dev.shell("input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard")   # 无密码锁屏的机器 (荣耀) 也要解锁
             if uses_layer(k):
                 rec = arm_layer(a, out, name, k, note, lambda w, n, _k: locked(w, n, k_str))
             else:
                 rec = locked("plain", name, k_str)
-            rec = {"arm": name, "side": arm, "kind": k_str, "pair": pair + 1, "seq": seq + 1, **rec, "t": time.time()}
+            rec = {"arm": name, "side": arm, "kind": k_str, "pair": pair + 1, "seq": seq + 1, **rec, "cool_wait_s": cool_wait,
+                   "t": time.time()}
             if rec.get("shot") and os.path.exists(rec["shot"]):
                 if k["kind"] == "native" and ref_shot is None and not rec.get("error"):
                     ref_shot = rec["shot"]
