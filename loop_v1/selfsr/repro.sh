@@ -8,7 +8,8 @@
 #   4. layer   vs ip:$IP_MODE:$IP_FPS:...            层内插帧
 #   5. native  vs gfrc:111                           厂商 G-FRC+ (超分+插帧) 对标, 只在有 G-FRC+ 的机器上跑
 #   6. gfrc:101 vs sr:1:$SR_FULL+gfrc:101            G-FRC+ 只超分 vs 自研超分 (G-FRC+ 开着放开厂商限帧, 自研出图), 同上
-# 环境变量: SR_FULL (2688x1216:1.0) SR_SCALE (0.56) SR_OUT (2141x969:0.8) IP_MODE (bm) IP_FPS (120)
+# 环境变量: ENTER_SCRIPT (onboard 认不出时的进门脚本) KEEP_LAYER_PROP (1 = 全程保留层属性)
+#           SR_FULL (本机屏幕:1.0) SR_SCALE (0.56) SR_OUT (2141x969:0.8) IP_MODE (bm) IP_FPS (120)
 #           IP_TUNE (stamp=0,panel=120) COOL_MAX (42) SETS ("1 2 3 4 5 6")
 # 前提: 手机已 root、游戏已装好并登录过 (onboard 能进大世界)。层用 knobs/gray/build/build_layer.sh 现编。
 # 每组结束 (含 Ctrl-C) 都把 Game Mode、G-FRC+ 位、debug.knobs.*、刷新率、风扇、屏幕超时写回并回读核对,
@@ -19,7 +20,16 @@ ROUNDS="${2:-6}"
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 OUT="${3:-$ROOT/_runs/selfsr_$(date +%Y%m%d-%H%M%S)}"
 PKG="${4:-com.miHoYo.Yuanshen}"
-SR_FULL="${SR_FULL:-2688x1216:1.0}"
+# 满分辨率超分目标 = 本机屏幕横屏尺寸 (换机不用改)
+PANEL=$(adb -s "$SERIAL" shell wm size | tr -d '\r' | sed -n 's/.*: *\([0-9]*\)x\([0-9]*\)$/\1 \2/p' | tail -1 | awk '{print ($1>$2)?$1"x"$2:$2"x"$1}')
+SR_FULL="${SR_FULL:-$PANEL:1.0}"
+# 已知游戏的进门方式: 原神走 onboard; Megacity Metro 的 onboard 认不出已进游戏, 用固定脚本, 且要全程保留层属性
+case "$PKG" in
+  com.unity.megacity.metro)
+    ENTER_SCRIPT="${ENTER_SCRIPT:-s:10;t:0.207,0.484;s:4;t:0.5,0.558;s:3;t:0.207,0.484;s:12;t:0.505,0.884;s:5}"
+    KEEP_LAYER_PROP="${KEEP_LAYER_PROP:-1}" ;;
+esac
+ENTER_SCRIPT="${ENTER_SCRIPT:-}"; KEEP_LAYER_PROP="${KEEP_LAYER_PROP:-}"
 SR_SCALE="${SR_SCALE:-0.56}"; SR_OUT="${SR_OUT:-2141x969:0.8}"
 IP_MODE="${IP_MODE:-bm}"; IP_FPS="${IP_FPS:-120}"; IP_TUNE="${IP_TUNE:-stamp=0,panel=120}"
 COOL_MAX="${COOL_MAX:-42}"
@@ -38,7 +48,8 @@ cp "$ROOT/knobs/gray/build/out/libVkLayer_refknobs.so" "$SO"
 HAS_GFRC=$(adb -s "$SERIAL" shell getprop ro.vendor.feature.zte_feature_gfrc | tr -d '\r')
 run() {  # run <组名> <A> <B>
   PHONEFARM_BIN="$BIN" python3 -I "$ROOT/loop_v1/selfsr/selfsr_ab.py" run --serial "$SERIAL" --pkg "$PKG" \
-    --out "$OUT/$1" --a "$2" --b "$3" --rounds "$ROUNDS" --so "$SO" --phonefarm "$BIN" --fan --cool-max "$COOL_MAX"
+    --out "$OUT/$1" --a "$2" --b "$3" --rounds "$ROUNDS" --so "$SO" --phonefarm "$BIN" --fan --cool-max "$COOL_MAX" \
+    ${ENTER_SCRIPT:+--enter-script "$ENTER_SCRIPT"} ${KEEP_LAYER_PROP:+--keep-layer-prop}
 }
 for g in $SETS; do
   case $g in

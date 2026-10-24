@@ -247,7 +247,35 @@ def layer_absent(dev, pkg):
     return (not has_so) and prop == "", {"so_present": has_so, "debug.vulkan.layers": prop}
 
 
+def enter_by_script(a, out, name, cold):
+    """--enter-script: 给 onboard 认不出「已在游戏里」的游戏用的固定进门脚本。
+    步骤用 ; 分隔: s:<秒> 等待, t:<x>,<y> 点屏幕 (横屏下的比例坐标)。cold 时先冷启动游戏。"""
+    dev = Dev(a.serial)
+    log = []
+    if cold:
+        dev.shell(f"am force-stop {a.pkg}")
+        dev.shell(f"monkey -p {a.pkg} -c android.intent.category.LAUNCHER 1")
+    for step in a.enter_script.split(";"):
+        op, _, arg = step.strip().partition(":")
+        if op == "s":
+            time.sleep(float(arg))
+        elif op == "t":
+            fx, fy = (float(v) for v in arg.split(","))
+            m = re.search(r" cur=(\d+)x(\d+)", dev.shell("dumpsys window displays | grep -m1 ' cur='"))
+            w, h = (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+            if not w:
+                return 1, "读不到屏幕尺寸"
+            dev.shell(f"input tap {int(fx * w)} {int(fy * h)}")
+        log.append(step)
+    fg = dev.shell("dumpsys activity activities | grep -m1 -E 'topResumedActivity|mResumedActivity'")
+    os.makedirs(os.path.join(out, "onboard"), exist_ok=True)
+    json.dump({"steps": log, "foreground": fg.strip()}, open(os.path.join(out, "onboard", f"{name}.json"), "w"), ensure_ascii=False)
+    return (0, "") if a.pkg in fg else (1, f"脚本走完但前台不是 {a.pkg}: {fg.strip()[:200]}")
+
+
 def onboard(a, out, name, cold):
+    if getattr(a, "enter_script", None):
+        return enter_by_script(a, out, name, cold)
     args = [a.phonefarm, "onboard", "--package", a.pkg, "--serial", a.serial, "--enter-only", "--no-guest",
             "--out", os.path.join(out, "onboard", name)]
     if not cold:
@@ -354,6 +382,8 @@ def arm_layer(a, out, name, k, note, locked):
            "--out", sdir, "--max-seconds", str(a.session_seconds)]
     if a.so:
         cmd += ["--so", a.so]
+    if a.keep_layer_prop:
+        cmd += ["--keep-prop"]
     proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
     st = None
     try:
@@ -461,6 +491,10 @@ def main():
     ap.add_argument("--b", type=parse_kind, default=parse_kind("layer"))
     ap.add_argument("--rounds", type=int, default=6)
     ap.add_argument("--so", default=None, help="层 .so (挂层臂); 缺省用 gray-layer session 自己的")
+    ap.add_argument("--enter-script", default=None,
+                    help="onboard 认不出进了游戏时用固定脚本进门: 's:<秒>;t:<x>,<y>;…' (横屏比例坐标), 冷启动由脚本自己做")
+    ap.add_argument("--keep-layer-prop", action="store_true",
+                    help="整个会话保留 debug.vulkan.layers (Unity 先建一个探测用 VkInstance、再建真正的那种游戏需要; 原神不需要)")
     ap.add_argument("--settle", type=float, default=20)
     ap.add_argument("--window", type=int, default=10)
     ap.add_argument("--session-seconds", type=int, default=1200)
@@ -526,6 +560,8 @@ def main():
                os.path.abspath(__file__), "_locked", "--what", what, "--name", name, "--kind", k_str,
                "--orig-mode", orig_mode, "--serial", a.serial, "--pkg", a.pkg, "--out", out,
                "--settle", str(a.settle), "--window", str(a.window), "--phonefarm", a.phonefarm]
+        if a.enter_script:
+            cmd += ["--enter-script", a.enter_script]
         r = None
         for _ in range(90):   # devlock run 轮不到时立即返回 1 (不等), 有界重试
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800,
