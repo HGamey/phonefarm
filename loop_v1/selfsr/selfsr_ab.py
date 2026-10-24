@@ -250,7 +250,8 @@ def arm_layer(a, out, name, k, note, locked):
             rec["selfsr"] = s1
             up = (s1.get("upscaled") or 0) - (s0.get("upscaled") or 0)
             rec["selfsr_upscaled_in_window"] = up
-            if up <= 0:
+            # 层的 marker 每 300 帧落一次盘, 游戏帧率低时窗口内可能一次没落: 判「在超分」看累计次数
+            if (s1.get("upscaled") or 0) <= 0:
                 rec["error"] = f"层没在超分 (selfsr={s1})"
         if k["kind"] in ("ip", "srip"):
             ipj = m1.get("interp") or {}
