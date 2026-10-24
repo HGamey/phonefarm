@@ -528,16 +528,23 @@ def main():
     if "no intervention" not in orig_cfg.lower() and "downscale" in orig_cfg.lower():
         note(f"开跑前本包已有 Game Mode 干预, 拒绝开始 (不覆盖别人的设置): {orig_cfg[-200:]}")
         return 2
+    # 机身风扇: 红魔 /sys/kernel/fan (enable + 档位 1..5); 荣耀 hn_thermal/fan (目标转速, 0 = 关, 最高 fan_max_rpm)
     FAN = "/sys/kernel/fan"
-    fan_orig = None
+    HFAN = "/sys/devices/virtual/hn_thermal/fan"
+    fan_orig = None   # ("redmagic", enable, level) | ("honor", target_rpm)
     if a.fan:
         fo = dev.su(f"cat {FAN}/fan_enable {FAN}/fan_speed_level 2>/dev/null").split()
+        ho = dev.su(f"cat {HFAN}/fan_target_rpm {HFAN}/fan_max_rpm 2>/dev/null").split()
         if len(fo) == 2:
-            fan_orig = fo
+            fan_orig = ("redmagic", fo[0], fo[1])
             dev.su(f"echo 1 > {FAN}/fan_enable; echo 5 > {FAN}/fan_speed_level")
-            note(f"风扇: 原值 enable={fo[0]} level={fo[1]}, 本轮开到 1/5")
+            note(f"风扇 (红魔): 原值 enable={fo[0]} level={fo[1]}, 本轮开到 1/5")
+        elif len(ho) == 2:
+            fan_orig = ("honor", ho[0])
+            dev.su(f"echo {ho[1]} > {HFAN}/fan_target_rpm")
+            note(f"风扇 (荣耀): 原目标转速 {ho[0]}, 本轮 {ho[1]}")
         else:
-            note("风扇: 本机没有 /sys/kernel/fan, 跳过")
+            note("风扇: 本机没有已知的风扇节点, 跳过")
     dev.shell("settings put system screen_off_timeout 1800000")
     dev.adb(f"push {shlex.quote(os.path.join(REPO, 'loop_v1/tools/ftrace_capture.sh'))} {DEV_TRACE}", check=True)
     stop = {"flag": False}
@@ -582,9 +589,12 @@ def main():
                 break
     finally:
         r = locked("restore", "end", "native")
-        if fan_orig:
-            dev.su(f"echo {fan_orig[0]} > {FAN}/fan_enable; echo {fan_orig[1]} > {FAN}/fan_speed_level")
+        if fan_orig and fan_orig[0] == "redmagic":
+            dev.su(f"echo {fan_orig[1]} > {FAN}/fan_enable; echo {fan_orig[2]} > {FAN}/fan_speed_level")
             r["fan_restored"] = dev.su(f"cat {FAN}/fan_enable {FAN}/fan_speed_level").split()
+        elif fan_orig and fan_orig[0] == "honor":
+            dev.su(f"echo {fan_orig[1]} > {HFAN}/fan_target_rpm")
+            r["fan_restored"] = dev.su(f"cat {HFAN}/fan_target_rpm").split()
         dev.shell(f"settings put system screen_off_timeout {orig_timeout}")
         ok, info = layer_absent(dev, a.pkg)
         json.dump({**r, "layer_absent": ok, "layer_info": info}, open(os.path.join(out, "restore.json"), "w"), ensure_ascii=False)
