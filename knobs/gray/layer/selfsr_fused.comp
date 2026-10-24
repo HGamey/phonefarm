@@ -1,0 +1,72 @@
+#version 450
+// selfsr_fused.comp — selfsr_up.comp (Lanczos2 + 2x2 去振铃) 与 selfsr_rcas.comp (RCAS) 合成一个 pass:
+// 每个 16x16 工作组先把它要输出的 16x16 加一圈 (18x18) 的放大结果算进共享内存, 再在共享内存上做 RCAS 写出,
+// 省掉中间整张图的写出与读回。图像边缘与两遍版一致 (RCAS 的邻域夹在 [0, out_size-1])。
+// 契约: binding 0 = 只读源 (combined sampler, 只用 texelFetch), binding 1 = 只写目标, 工作组 16x16。
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(binding = 0) uniform sampler2D src;
+layout(binding = 1, rgba8) uniform writeonly image2D dst;
+layout(push_constant) uniform PC {
+    ivec2 in_size;
+    ivec2 out_size;
+    float sharp;
+} pc;
+
+shared vec3 tile[18][18];
+
+float lanczos2(float x) {
+    x = abs(x);
+    if (x < 1e-5) return 1.0;
+    if (x >= 2.0) return 0.0;
+    const float PI = 3.14159265358979;
+    float px = PI * x;
+    return 2.0 * sin(px) * sin(px * 0.5) / (px * px);
+}
+
+vec3 fetch(ivec2 p) { return texelFetch(src, clamp(p, ivec2(0), pc.in_size - 1), 0).rgb; }
+
+vec3 upscale(ivec2 o) {
+    vec2 scale = vec2(pc.in_size) / vec2(pc.out_size);
+    vec2 p = (vec2(o) + 0.5) * scale - 0.5;
+    ivec2 b = ivec2(floor(p));
+    vec2 f = p - vec2(b);
+    vec4 wx = vec4(lanczos2(f.x + 1.0), lanczos2(f.x), lanczos2(f.x - 1.0), lanczos2(f.x - 2.0));
+    vec4 wy = vec4(lanczos2(f.y + 1.0), lanczos2(f.y), lanczos2(f.y - 1.0), lanczos2(f.y - 2.0));
+    vec3 acc = vec3(0.0);
+    float wsum = 0.0;
+    vec3 lo = vec3(1.0), hi = vec3(0.0);
+    for (int j = 0; j < 4; j++) {
+        for (int i = 0; i < 4; i++) {
+            vec3 c = fetch(b + ivec2(i - 1, j - 1));
+            float w = wx[i] * wy[j];
+            acc += c * w;
+            wsum += w;
+            if ((i == 1 || i == 2) && (j == 1 || j == 2)) { lo = min(lo, c); hi = max(hi, c); }
+        }
+    }
+    return clamp(acc / wsum, lo, hi);
+}
+
+void main() {
+    ivec2 base = ivec2(gl_WorkGroupID.xy) * 16 - 1;   // tile[0][0] 对应的输出坐标
+    uint lid = gl_LocalInvocationIndex;
+    for (uint k = lid; k < 18u * 18u; k += 256u) {
+        ivec2 t = ivec2(int(k % 18u), int(k / 18u));
+        tile[t.y][t.x] = upscale(clamp(base + t, ivec2(0), pc.out_size - 1));
+    }
+    barrier();
+    ivec2 o = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(o, pc.out_size))) return;
+    ivec2 t = ivec2(gl_LocalInvocationID.xy) + 1;
+    vec3 c = tile[t.y][t.x];
+    if (pc.sharp <= 0.0) { imageStore(dst, o, vec4(c, 1.0)); return; }
+    vec3 n = tile[t.y - 1][t.x], s = tile[t.y + 1][t.x], w = tile[t.y][t.x - 1], e = tile[t.y][t.x + 1];
+    vec3 mn = min(min(min(n, s), min(w, e)), c);
+    vec3 mx = max(max(max(n, s), max(w, e)), c);
+    vec3 hit_min = mn / (4.0 * mx + 1e-5);
+    vec3 hit_max = (1.0 - mx) / (4.0 * mn - 4.0 + 1e-5);
+    vec3 l3 = max(-hit_min, hit_max);
+    float lobe = clamp(max(l3.r, max(l3.g, l3.b)), -0.1875, 0.0) * pc.sharp;
+    vec3 r = (lobe * (n + s + w + e) + c) / (4.0 * lobe + 1.0);
+    imageStore(dst, o, vec4(clamp(r, 0.0, 1.0), 1.0));
+}

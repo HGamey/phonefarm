@@ -29,6 +29,8 @@ static const unsigned char kSelfsrUpSpv[] = {0};
 static const unsigned int kSelfsrUpSpvLen = 0;
 static const unsigned char kSelfsrRcasSpv[] = {0};
 static const unsigned int kSelfsrRcasSpvLen = 0;
+static const unsigned char kSelfsrFusedSpv[] = {0};
+static const unsigned int kSelfsrFusedSpvLen = 0;
 #endif
 
 #define SR_LOG(...) __android_log_print(ANDROID_LOG_INFO, "refknobs", "selfsr: " __VA_ARGS__)
@@ -54,6 +56,10 @@ struct Swap {
     VkDeviceMemory T_mem = VK_NULL_HANDLE, O_mem = VK_NULL_HANDLE, P_mem = VK_NULL_HANDLE;
     VkImageView T_view = VK_NULL_HANDLE, O_view = VK_NULL_HANDLE, P_view = VK_NULL_HANDLE;
     VkDescriptorSet set = VK_NULL_HANDLE, set2 = VK_NULL_HANDLE;
+    // 直写: swapchain 图带 STORAGE 时, 融合着色器直接写进去 (每张图一个视图 + 描述符集), 省掉 O → swapchain 拷贝
+    bool direct = false;
+    std::vector<VkImageView> views;
+    std::vector<VkDescriptorSet> dsets;
     bool T_init = false, O_init = false;
     uint64_t frames = 0;
 };
@@ -93,6 +99,7 @@ struct Dev {
     VkDescriptorPool dpool = VK_NULL_HANDLE;
     VkPipelineLayout pl = VK_NULL_HANDLE;
     VkPipeline pipe = VK_NULL_HANDLE, pipe_rcas = VK_NULL_HANDLE;
+    bool fused = false;   // pipe 是 selfsr_fused.comp (放大 + RCAS 一个 pass)
     bool pipe_tried = false;
     std::map<VkSwapchainKHR, Swap> swaps;
     std::vector<VkSemaphore> retired_sems;
@@ -104,7 +111,7 @@ uint32_t g_want_w = 0, g_want_h = 0;
 float g_sharp = 0.f;                        // RCAS 强度, 0 = 不锐化
 std::map<void*, Dev*> g_devs;
 std::string g_reason;                       // 最近一次没能启用的原因
-uint64_t g_up = 0, g_passthrough = 0, g_same_size = 0;
+uint64_t g_up = 0, g_passthrough = 0, g_same_size = 0, g_direct_frames = 0;
 std::map<std::string, uint64_t> g_fb;
 uint32_t g_last_in_w = 0, g_last_in_h = 0, g_last_out_w = 0, g_last_out_h = 0;
 std::vector<uint64_t> g_cpu_us;             // 录制+提交的 CPU 耗时 (最近 1024 个)
@@ -170,14 +177,14 @@ bool ensure_pipeline(Dev* D) {
         {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
     VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 2, b};
     if (D->CreateDescriptorSetLayout(D->dev, &dli, nullptr, &D->dsl) != VK_SUCCESS) { g_reason = "descriptor_layout"; return false; }
-    VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8}};
+    VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 32}};
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, nullptr,
-                                   VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT, 8, 2, ps};
+                                   VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT, 32, 2, ps};
     if (D->CreateDescriptorPool(D->dev, &dpi, nullptr, &D->dpool) != VK_SUCCESS) { g_reason = "descriptor_pool"; return false; }
-    VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
+    VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 32};
     VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr, 0, 1, &D->dsl, 1, &pcr};
     if (D->CreatePipelineLayout(D->dev, &pli, nullptr, &D->pl) != VK_SUCCESS) { g_reason = "pipeline_layout"; return false; }
-    if (kSelfsrUpSpvLen < 20 || (g_sharp > 0 && kSelfsrRcasSpvLen < 20)) { g_reason = "shader_missing"; return false; }
+    if (kSelfsrFusedSpvLen < 20 && (kSelfsrUpSpvLen < 20 || (g_sharp > 0 && kSelfsrRcasSpvLen < 20))) { g_reason = "shader_missing"; return false; }
     auto make = [&](const unsigned char* spv, unsigned len, VkPipeline* out) {
         VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, nullptr, 0, len,
                                      reinterpret_cast<const uint32_t*>(spv)};
@@ -191,6 +198,12 @@ bool ensure_pipeline(Dev* D) {
         if (r != VK_SUCCESS) { *out = VK_NULL_HANDLE; return false; }
         return true;
     };
+    if (kSelfsrFusedSpvLen >= 20) {   // 首选融合版: 一个 pass, 锐化强度走 push constant (0 = 不锐化)
+        if (!make(kSelfsrFusedSpv, kSelfsrFusedSpvLen, &D->pipe)) { g_reason = "compute_pipeline_fused"; return false; }
+        D->fused = true;
+        SR_LOG("管线就绪 (融合) family=%u", D->family);
+        return true;
+    }
     if (!make(kSelfsrUpSpv, kSelfsrUpSpvLen, &D->pipe)) { g_reason = "compute_pipeline"; return false; }
     if (g_sharp > 0 && !make(kSelfsrRcasSpv, kSelfsrRcasSpvLen, &D->pipe_rcas)) {
         D->DestroyPipeline(D->dev, D->pipe, nullptr); D->pipe = VK_NULL_HANDLE;
@@ -205,6 +218,8 @@ void release_swap_locked(Dev* D, Swap& S) {
     if (S.set) D->FreeDescriptorSets(D->dev, D->dpool, 1, &S.set);
     if (S.set2) D->FreeDescriptorSets(D->dev, D->dpool, 1, &S.set2);
     for (VkImageView v : {S.T_view, S.O_view, S.P_view}) if (v) D->DestroyImageView(D->dev, v, nullptr);
+    for (VkDescriptorSet s : S.dsets) if (s) D->FreeDescriptorSets(D->dev, D->dpool, 1, &s);
+    for (VkImageView v : S.views) if (v) D->DestroyImageView(D->dev, v, nullptr);
     for (VkImage i : {S.T, S.O, S.P}) if (i) D->DestroyImage(D->dev, i, nullptr);
     for (VkDeviceMemory m : {S.T_mem, S.O_mem, S.P_mem}) if (m) D->FreeMemory(D->dev, m, nullptr);
     for (auto s : S.sems) if (s) D->retired_sems.push_back(s);
@@ -340,6 +355,12 @@ bool sr_patch_swapchain_ci(VkDevice dev, VkSwapchainCreateInfoKHR* ci) {
     }
     ci->imageExtent = {g_want_w, g_want_h};
     ci->imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    // 直写: surface 给 STORAGE、格式是 UNORM (SRGB 图不能直接当 rgba8 storage 写) 就要上
+    VkFormatProperties fp{};
+    D->GetPhysicalDeviceFormatProperties(D->phys, VK_FORMAT_R8G8B8A8_UNORM, &fp);
+    if ((caps.supportedUsageFlags & VK_IMAGE_USAGE_STORAGE_BIT) && ci->imageFormat == VK_FORMAT_R8G8B8A8_UNORM &&
+        (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT))
+        ci->imageUsage |= VK_IMAGE_USAGE_STORAGE_BIT;
     return true;
 }
 
@@ -394,9 +415,20 @@ void sr_on_swapchain(VkDevice dev, VkSwapchainKHR sc, const VkSwapchainCreateInf
     };
     if (ok && !bind(&S.set, S.T_view, S.O_view)) { ok = false; g_reason = "descriptor_set"; }
     if (ok && rc && !bind(&S.set2, S.O_view, S.P_view)) { ok = false; g_reason = "descriptor_set2"; }
+    if (ok && D->fused && (used->imageUsage & VK_IMAGE_USAGE_STORAGE_BIT) && used->imageFormat == VK_FORMAT_R8G8B8A8_UNORM) {
+        bool d = true;
+        S.views.assign(n, VK_NULL_HANDLE); S.dsets.assign(n, VK_NULL_HANDLE);
+        for (uint32_t i = 0; d && i < n; i++) {
+            VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            vci.image = S.imgs[i]; vci.viewType = VK_IMAGE_VIEW_TYPE_2D; vci.format = VK_FORMAT_R8G8B8A8_UNORM;
+            vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            d = D->CreateImageView(dev, &vci, nullptr, &S.views[i]) == VK_SUCCESS && bind(&S.dsets[i], S.T_view, S.views[i]);
+        }
+        S.direct = d;   // 建不成就走 O → 拷贝 (已建的在 release 时收)
+    }
     S.active = ok;
-    SR_LOG("swapchain 游戏要 %ux%u → 实际 %ux%u fmt=%u images=%u active=%d%s%s", S.in_w, S.in_h, S.out_w, S.out_h,
-           (unsigned)S.fmt, n, (int)ok, ok ? "" : " 原因=", ok ? "" : g_reason.c_str());
+    SR_LOG("swapchain 游戏要 %ux%u → 实际 %ux%u fmt=%u images=%u active=%d fused=%d direct=%d%s%s", S.in_w, S.in_h, S.out_w,
+           S.out_h, (unsigned)S.fmt, n, (int)ok, (int)D->fused, (int)S.direct, ok ? "" : " 原因=", ok ? "" : g_reason.c_str());
     D->swaps[sc] = std::move(S);
 }
 
@@ -441,13 +473,25 @@ VkResult sr_on_present(VkQueue q, const VkPresentInfoKHR* pi, PFN_vkQueuePresent
     rg.extent = {S.in_w, S.in_h, 1};
     D->CmdCopyImage(cb, N, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, S.T, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rg);
     barrier(D, cb, S.T, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, TR, CS);
+    struct { int32_t iw, ih, ow, oh; float sharp; int32_t pad[3]; } pc{(int32_t)S.in_w, (int32_t)S.in_h, (int32_t)S.out_w,
+                                                                       (int32_t)S.out_h, g_sharp, {0, 0, 0}};
+    const bool direct = S.direct && idx < S.dsets.size() && S.dsets[idx];
+    if (direct) {   // 融合着色器直接写 swapchain 图: N 读完左上角后转 GENERAL 给计算着色器写
+        barrier(D, cb, N, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT, TR, CS);
+        D->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, D->pipe);
+        D->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, D->pl, 0, 1, &S.dsets[idx], 0, nullptr);
+        D->CmdPushConstants(cb, D->pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+        D->CmdDispatch(cb, (S.out_w + 15) / 16, (S.out_h + 15) / 16, 1);
+        barrier(D, cb, N, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_SHADER_WRITE_BIT, 0, CS, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+        g_direct_frames++;
+    }
+    VkImage R = S.O;   // 非直写时拷回 swapchain 的那张
+    if (!direct) {
     barrier(D, cb, S.O, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT, TR, CS);
     D->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, D->pipe);
     D->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, D->pl, 0, 1, &S.set, 0, nullptr);
-    int32_t pc[4] = {(int32_t)S.in_w, (int32_t)S.in_h, (int32_t)S.out_w, (int32_t)S.out_h};
-    D->CmdPushConstants(cb, D->pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+    D->CmdPushConstants(cb, D->pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
     D->CmdDispatch(cb, (S.out_w + 15) / 16, (S.out_h + 15) / 16, 1);
-    VkImage R = S.O;   // 拷回 swapchain 的那张
     if (S.set2) {
         barrier(D, cb, S.O, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, CS, CS);
         barrier(D, cb, S.P, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT, CS, CS);
@@ -465,6 +509,7 @@ VkResult sr_on_present(VkQueue q, const VkPresentInfoKHR* pi, PFN_vkQueuePresent
     full.extent = {S.out_w, S.out_h, 1};
     D->CmdCopyImage(cb, R, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, N, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &full);
     barrier(D, cb, N, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_WRITE_BIT, 0, TR, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    }
     D->EndCommandBuffer(cb);
     std::vector<VkPipelineStageFlags> stages(pi->waitSemaphoreCount, TR);
     VkSubmitInfo sub{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -501,8 +546,8 @@ std::string sr_json() {
     char b[640];
     snprintf(b, sizeof b,
              "{\"want\":[%u,%u],\"sharp\":%.2f,\"game_extent\":[%u,%u],\"swap_extent\":[%u,%u],\"upscaled\":%llu,\"same_size\":%llu,"
-             "\"passthrough\":%llu,\"reason\":\"%s\",\"cpu_us_p50\":%llu,\"cpu_us_p95\":%llu,\"fallbacks\":{",
+             "\"passthrough\":%llu,\"direct_frames\":%llu,\"reason\":\"%s\",\"cpu_us_p50\":%llu,\"cpu_us_p95\":%llu,\"fallbacks\":{",
              g_want_w, g_want_h, g_sharp, g_last_in_w, g_last_in_h, g_last_out_w, g_last_out_h, (unsigned long long)g_up,
-             (unsigned long long)g_same_size, (unsigned long long)g_passthrough, g_reason.c_str(), pct(0.5), pct(0.95));
+             (unsigned long long)g_same_size, (unsigned long long)g_passthrough, (unsigned long long)g_direct_frames, g_reason.c_str(), pct(0.5), pct(0.95));
     return std::string(b) + fb + "}}";
 }
