@@ -8,7 +8,7 @@
 #   4. layer   vs ip:$IP_MODE:$IP_FPS:...            层内插帧
 #   5. native  vs gfrc:111                           厂商 G-FRC+ (超分+插帧) 对标, 只在有 G-FRC+ 的机器上跑
 #   6. gfrc:101 vs sr:1:$SR_FULL+gfrc:101            G-FRC+ 只超分 vs 自研超分 (G-FRC+ 开着放开厂商限帧, 自研出图), 同上
-# 环境变量: SR_FULL (2688x1216:0.8) SR_SCALE (0.56) SR_OUT (2141x969:0.8) IP_MODE (bm) IP_FPS (120)
+# 环境变量: SR_FULL (2688x1216:1.0) SR_SCALE (0.56) SR_OUT (2141x969:0.8) IP_MODE (bm) IP_FPS (120)
 #           IP_TUNE (stamp=0,panel=120) COOL_MAX (42) SETS ("1 2 3 4 5 6")
 # 前提: 手机已 root、游戏已装好并登录过 (onboard 能进大世界)。层用 knobs/gray/build/build_layer.sh 现编。
 # 每组结束 (含 Ctrl-C) 都把 Game Mode、G-FRC+ 位、debug.knobs.*、刷新率、风扇、屏幕超时写回并回读核对,
@@ -19,7 +19,7 @@ ROUNDS="${2:-6}"
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 OUT="${3:-$ROOT/_runs/selfsr_$(date +%Y%m%d-%H%M%S)}"
 PKG="${4:-com.miHoYo.Yuanshen}"
-SR_FULL="${SR_FULL:-2688x1216:0.8}"
+SR_FULL="${SR_FULL:-2688x1216:1.0}"
 SR_SCALE="${SR_SCALE:-0.56}"; SR_OUT="${SR_OUT:-2141x969:0.8}"
 IP_MODE="${IP_MODE:-bm}"; IP_FPS="${IP_FPS:-120}"; IP_TUNE="${IP_TUNE:-stamp=0,panel=120}"
 COOL_MAX="${COOL_MAX:-42}"
