@@ -246,6 +246,8 @@ def onboard(a, out, name, cold):
     if not cold:
         # 挂层臂: 设备租约在 gray-layer session 手里, onboard 自己再拿锁会一直排队; 在会话的租约内导航
         args += ["--no-cold", "--no-devlock"]
+    elif os.environ.get("SELFSR_UNDER_LEASE") == "1":   # 不挂层臂: 已在 phonefarm lease 里
+        args.append("--no-devlock")
     r = subprocess.run(args, capture_output=True, text=True, timeout=900)
     return r.returncode, r.stderr[-600:]
 
@@ -496,14 +498,15 @@ def main():
     kb = raw[raw.index("--b") + 1] if "--b" in raw else "layer"
 
     def locked(what, name, k_str):
-        cmd = [os.path.join(REPO, "tools", "devlock"), "run", f"selfsr-{what}-{name}", "--", sys.executable, "-I",
+        # 按手机的租约 (phonefarm lease --serial): 两台手机各自排队, 互不阻塞 (tools/devlock 是整机一把锁)
+        cmd = [a.phonefarm, "lease", "--serial", a.serial, "--timeout-ms", "1800000", "--", sys.executable, "-I",
                os.path.abspath(__file__), "_locked", "--what", what, "--name", name, "--kind", k_str,
                "--orig-mode", orig_mode, "--serial", a.serial, "--pkg", a.pkg, "--out", out,
                "--settle", str(a.settle), "--window", str(a.window), "--phonefarm", a.phonefarm]
         r = None
         for _ in range(90):   # devlock run 轮不到时立即返回 1 (不等), 有界重试
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800,
-                               env={**os.environ, "PHONEFARM_BIN": a.phonefarm})
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=3700,
+                               env={**os.environ, "PHONEFARM_BIN": a.phonefarm, "SELFSR_UNDER_LEASE": "1"})
             if r.returncode == 0 or not any(s in r.stderr for s in ("not your turn", "busy:")):
                 break
             time.sleep(10)
