@@ -168,6 +168,41 @@ def measure(dev, a, name, out):
             "out_res": src, "sharp_full": sharpness(shot), "sharp_hud": sharpness(shot, HUD_BOX), "shot": shot}
 
 
+def uptime_ns(dev):
+    """手机的 CLOCK_MONOTONIC (≈ /proc/uptime, 不含休眠), 与层 CSV 里的时刻同一个钟。"""
+    try:
+        return int(float(dev.shell("cat /proc/uptime").split()[0]) * 1e9)
+    except (ValueError, IndexError):
+        return None
+
+
+def interp_window(dev, a, name, out, t0, t1):
+    """层的 knobs_interp_frames.csv 里 [t0, t1] 内实际上屏的帧: 每秒几张真实帧 / 合成帧, 上屏间隔。"""
+    import statistics as st
+    path = f"/storage/emulated/0/Android/data/{a.pkg}/files/knobs_interp_frames.csv"
+    local = os.path.join(out, "traces", f"{name}_interp.csv")
+    dev.adb(f"exec-out su -c {shlex.quote('cat ' + path)} > {shlex.quote(local)}")
+    rows = []
+    for ln in open(local, errors="replace"):
+        f = ln.strip().split(",")
+        if len(f) >= 8 and f[0] == "timing":
+            try:
+                rows.append((int(f[7]), f[2]))
+            except ValueError:
+                pass
+    if t0 is None or t1 is None:
+        return {"status": "no_clock"}
+    win = sorted(r for r in rows if t0 <= r[0] <= t1)
+    span = (t1 - t0) / 1e9
+    if len(win) < 2:
+        return {"status": "no_samples", "rows": len(rows)}
+    iv = [(b[0] - a_[0]) / 1e6 for a_, b in zip(win, win[1:])]
+    return {"span_s": round(span, 2), "displayed_per_s": round(len(win) / span, 2),
+            "real_per_s": round(sum(1 for r in win if r[1] == "real") / span, 2),
+            "synth_per_s": round(sum(1 for r in win if r[1] == "synth") / span, 2),
+            "interval_p50_ms": round(st.median(iv), 2), "interval_max_ms": round(max(iv), 2)}
+
+
 def layer_absent(dev, pkg):
     lib = dev.su(f"ls -d /data/app/*/{pkg}-*/lib/arm64").strip().splitlines()
     has_so = any(dev.su(f"ls {shlex.quote(d)} | grep -c libVkLayer_refknobs").strip() not in ("0", "") for d in lib)
@@ -297,8 +332,14 @@ def arm_layer(a, out, name, k, note, locked):
             except Exception:
                 return {}
         m0 = marker()
+        t0 = uptime_ns(dev)
         rec.update(measure(dev, a, name, out))
+        t1 = uptime_ns(dev)
         m1 = marker()
+        if k["kind"] in ("ip", "srip"):   # 窗口内层回读的实际上屏 (会话累计的环形统计混着加载期, 不可用)
+            rec["interp_window"] = interp_window(dev, a, name, out, t0, t1)
+            iw = rec["interp_window"]
+            rec["displayed_per_s"] = iw.get("displayed_per_s")
         rec["layer_loaded"] = bool(m0.get("layer_loaded") and m1.get("layer_loaded"))
         f0 = (m0.get("readonly_stats") or {}).get("frames")
         f1 = (m1.get("readonly_stats") or {}).get("frames")
@@ -464,6 +505,7 @@ def main():
                 note(f"{name} ({k_str}): 显示 {rec.get('display_fps')} fps @{rec.get('display_hz')}Hz 游戏 {rec.get('game_fps')} fps "
                      f"p95 {rec.get('game_frame_p95_ms')} ms 锐度 {rec.get('sharp_full', 0):.1f} 输出 {rec.get('out_res')}"
                      + (f" 层帧数 {rec.get('layer_frames_in_window')}" if uses_layer(k) else "")
+                     + (f" 窗口上屏 {rec.get('interp_window')}" if rec.get('interp_window') else "")
                      + (f" 超分 {rec.get('selfsr_upscaled_in_window')} 次 {(rec.get('selfsr') or {}).get('game_extent')}→{(rec.get('selfsr') or {}).get('swap_extent')}" if k['kind'] in ('sr', 'srip') else ""))
             if uses_layer(k) and not rec.get("layer_removed", False):
                 note(f"{name}: 层没摘干净, 中止整轮 (先人工核对再继续)")
@@ -480,7 +522,7 @@ def main():
             and (not uses_layer(parse_kind(r["kind"])) or (r.get("layer_loaded") and r.get("layer_removed")))]
     pairs = sorted({r["pair"] for r in good if sum(1 for x in good if x["pair"] == r["pair"]) == 2})
     metrics = ["display_fps", "game_fps", "game_frame_p95_ms", "gpu_active_ms", "sharp_full", "sharp_hud", "ssim_vs_native_ref", "missed_frames",
-               "display_latency_p50_ms"]
+               "display_latency_p50_ms", "displayed_per_s"]
     res = {}
     for m in metrics:
         av = [next(x.get(m) for x in good if x["pair"] == p and x["side"] == "A") for p in pairs]
@@ -501,6 +543,7 @@ def main():
     names = {"display_fps": "上屏帧率", "game_fps": "游戏渲染帧率 (GPU 提交)", "game_frame_p95_ms": "游戏渲染 p95 帧时 (ms)",
              "gpu_active_ms": "每帧 GPU 忙碌 (ms, 均值)",
              "display_latency_p50_ms": "真实帧 present→上屏 p50 (ms)",
+             "displayed_per_s": "层回读: 窗口内每秒实际上屏 (真实+合成)",
              "sharp_full": "锐度 (拉普拉斯方差)", "sharp_hud": "右上角固定图标区锐度", "ssim_vs_native_ref": "与第一张原生截图的 SSIM", "missed_frames": "SF 丢帧 / 窗口"}
     md = [f"# {ka} (A) vs {kb} (B): {a.pkg}", "",
           f"每臂冷启动进大世界, 有效 {len(pairs)} 对, 精确符号翻转检验 (最小可能 p = {report['min_p_possible']})。"
