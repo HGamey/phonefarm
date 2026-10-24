@@ -274,7 +274,8 @@ def prepare(a, k, orig_mode):
     # 厂商 G-FRC+: 只改 settings global game_gfrc_mode 里本包那一项; 收尾写回开跑前原值 (orig.json)
     cur = dev.shell("settings get global game_gfrc_mode").strip()
     if cur not in ("", "null"):
-        dev.shell(f"settings put global game_gfrc_mode {shlex.quote(set_pkg_bits(cur, a.pkg, k.get('gfrc') or '000'))}")
+        # 先一律关; G-FRC+ 要在进世界之后再开才生效 (见 arm_plain)
+        dev.shell(f"settings put global game_gfrc_mode {shlex.quote(set_pkg_bits(cur, a.pkg, '000'))}")
     so = k.get("sr_opts") or {}
     dev.su("; ".join(f"setprop debug.knobs.selfsr_{o} {shlex.quote(so.get(o, ''))}" for o in SR_OPTS))
     mode = k.get("interp")
@@ -296,6 +297,18 @@ def arm_plain(a, out, name, k, orig_mode):
     if code != 0:
         rec["error"] = f"onboard: {err}"
         return rec
+    if k["kind"] == "gfrc":   # 进世界后再开 G-FRC+, 回读厂商属性确认生效 (启动前写好的不生效)
+        cur = dev.shell("settings get global game_gfrc_mode").strip()
+        dev.shell(f"settings put global game_gfrc_mode {shlex.quote(set_pkg_bits(cur, a.pkg, k['gfrc']))}")
+        time.sleep(8)
+        props = {p: dev.prop(f"vendor.gpp.{p}") for p in ("gfrc.interp.rate", "gfrc.upscale.ratio", "frc.enable")}
+        rec["gfrc_props"] = props
+        bits = k["gfrc"]
+        want_up = bits[2] == "1" and bits[0] != "0"
+        want_ip = bits[2] == "1" and bits[1] != "0"
+        if ((props["gfrc.upscale.ratio"] not in ("", "0")) != want_up) or ((props["gfrc.interp.rate"] not in ("", "0")) != want_ip):
+            rec["error"] = f"G-FRC+ 没按 {bits} 生效: {props}"
+            return rec
     time.sleep(a.settle)
     rec.update(measure(dev, a, name, out))
     dev.shell(f"am force-stop {a.pkg}")
