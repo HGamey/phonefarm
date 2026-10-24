@@ -8,7 +8,7 @@
   layer               只挂透传层 (gray-layer session --mode probe), 第 2 步用
   hwc:<F>             Android Game Mode 降分辨率 F (cmd game mode custom + cmd game set --downscale F), 放大交给 HWC
   ip:<合成方式>[:<帧率>[:键=值,...]]  挂层并开层内插帧 (interp_mode=dup/dupcur/bm/real, interp_fps=给窗口投的帧率,
-                      可选 pacing/acquire_ms/extra_images/lead_ns → debug.knobs.interp_<键>)
+                      可选 pacing/stamp/acquire_ms/extra_images/lead_ns → debug.knobs.interp_<键>)
   srip:<F>:<宽>x<高>:<锐化>:<合成方式>[:<帧率>]  超分 + 插帧叠加 (第 5 步)
   sr:<F>:<宽>x<高>[:<锐化>]  同上降分辨率 F, 再挂层并设 debug.knobs.selfsr=<宽>x<高>[:<锐化>]: 层在送显前把游戏的小图超分到 <宽>x<高>
 每臂: (devlock 下) 设好 Game Mode 与 selfsr 属性 → 冷启动进大世界 → 静置 --settle 秒 → --window 秒窗口并行采
@@ -33,7 +33,7 @@ PKG_DEFAULT = "com.miHoYo.Yuanshen"
 DEV_TRACE = "/data/local/tmp/selfsr_ftrace_capture.sh"
 SR_PROP = "debug.knobs.selfsr"
 IP_PROPS = ("debug.knobs.interp", "debug.knobs.interp_mode", "debug.knobs.interp_fps")
-IP_TUNE = ("pacing", "acquire_ms", "extra_images", "lead_ns")   # ip 臂第 4 段可设的 debug.knobs.interp_<键>
+IP_TUNE = ("pacing", "stamp", "acquire_ms", "extra_images", "lead_ns")   # ip 臂第 4 段可设的 debug.knobs.interp_<键>
 
 
 def parse_kind(s):

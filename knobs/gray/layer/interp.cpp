@@ -167,6 +167,7 @@ std::mutex g_m;
 bool g_on = false;
 std::string g_mode = "dup";
 bool g_pacing = true;
+bool g_stamp = true;       // interp_stamp=0: 开着 display_timing 回读上屏时刻, 但不给合成/真实帧定时刻 (纯 FIFO 依次送)
 long g_lead_ns = -1;       // -1 = 一个刷新周期
 long g_extra_images = 2;
 long g_acquire_ms = 4;
@@ -441,6 +442,8 @@ bool ip_init_from_props() {
     g_mode = m.empty() ? "dup" : m;
     std::string p = prop("debug.knobs.interp_pacing");
     g_pacing = p.empty() || p[0] == '1' || p[0] == 't' || p[0] == 'y';
+    std::string st = prop("debug.knobs.interp_stamp");
+    g_stamp = st.empty() || st[0] == '1';
     g_lead_ns = prop_long("debug.knobs.interp_lead_ns", -1, -1, 200000000);
     g_extra_images = prop_long("debug.knobs.interp_extra_images", 2, 1, 4);
     g_acquire_ms = prop_long("debug.knobs.interp_acquire_ms", 4, 0, 100);
@@ -448,7 +451,7 @@ bool ip_init_from_props() {
     std::string c = prop("debug.knobs.interp_csv");
     g_csv = c.empty() || c[0] == '1';
     if (!g_pacing) g_pacing_reason = "disabled_by_prop";
-    IP_LOG("开启: mode=%s pacing=%d lead_ns=%ld extra_images=%ld acquire_ms=%ld csv=%d", g_mode.c_str(), (int)g_pacing,
+    IP_LOG("开启: stamp=%d mode=%s pacing=%d lead_ns=%ld extra_images=%ld acquire_ms=%ld csv=%d", (int)g_stamp, g_mode.c_str(), (int)g_pacing,
            g_lead_ns, g_extra_images, g_acquire_ms, (int)g_csv);
     return true;
 }
@@ -731,7 +734,9 @@ VkResult ip_on_present(VkQueue q, const VkPresentInfoKHR* pi, PFN_vkQueuePresent
     const VkPresentTimesInfoGOOGLE* gt = game_times(pi);
     const uint64_t gdes = gt ? gt->pTimes[0].desiredPresentTime : 0;
     if (gt) g_fb["game_present_times"]++;
-    if (pace && gdes) {   // 游戏 (Swappy) 自己定了真实帧的时刻: 不动它, 合成帧排在它前面半个游戏周期
+    if (pace && !g_stamp) {
+        // 不定时刻: 两张都只带 presentID (desired=0), FIFO 依次占一个刷新周期; 节奏由游戏自己的帧率决定
+    } else if (pace && gdes) {   // 游戏 (Swappy) 自己定了真实帧的时刻: 不动它, 合成帧排在它前面半个游戏周期
         desiredN = gdes; targetN = gdes + R / 2;
         if (gdes > half + t) { desiredL = gdes - half; targetL = desiredL + R / 2; }
         S.last_target_n = targetN;

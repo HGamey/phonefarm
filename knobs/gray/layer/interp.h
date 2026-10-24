@@ -12,6 +12,7 @@
 //                         bm      = 块匹配运动补偿中间帧 (interp_bm.cpp)
 //                         <其它>  = 查 ip_register_synth 登记的名字 (I5 的 GPU 着色器 / NPU 调用挂在这里);
 //                                   没登记就退回 dup 并在 marker 里记 fallbacks.unknown_mode
+//   interp_stamp        1 (缺省) = 定 desiredPresentTime; 0 = 开着扩展只回读上屏时刻, 不定时刻 (纯 FIFO 依次送)
 //   interp_pacing       1 (缺省) = 用 VK_GOOGLE_display_timing 的 desiredPresentTime 定节奏;
 //                       0 = 不设时间戳, 只靠 FIFO 连续送两张 (要求屏幕 60 Hz 才会是 30→60)
 //   interp_lead_ns      合成帧目标显示时刻至少在「现在 + 这么多」之后, 缺省 = 一个刷新周期
