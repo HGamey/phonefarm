@@ -33,7 +33,7 @@ bool requested() {
         __system_property_get("debug.knobs.interp_backend", v);
         g_req = !strcmp(v, "sc") ? 1 : 0;
         char d[PROP_VALUE_MAX] = {0};
-        __system_property_get("debug.knobs.interp_sc_dst", d);   // 子图层在父图层坐标里的大小, 缺省取窗口尺寸
+        __system_property_get("debug.knobs.interp_sc_dst", d);   // 子图层在父图层坐标里的大小, 缺省 = 缓冲大小
         unsigned w = 0, h = 0;
         if (sscanf(d, "%ux%u", &w, &h) == 2) { g_dst_w = (int32_t)w; g_dst_h = (int32_t)h; }
     }
@@ -287,8 +287,10 @@ void sc_show(VkDevice dev, const std::vector<std::pair<ScBuf*, int64_t>>& frames
         ASurfaceTransaction* t = g_api.txnCreate();
         if (!t) continue;
         if (!D->geometry_set) {
-            int32_t dw = g_dst_w ? g_dst_w : (g_api.winW ? g_api.winW(g_window) : (int32_t)w);
-            int32_t dh = g_dst_h ? g_dst_h : (g_api.winH ? g_api.winH(g_window) : (int32_t)h);
+            // 子图层在父图层 (游戏 SurfaceView) 的坐标里: 父图层自带「缓冲 → 屏幕」的缩放, 子图层跟着它缩放,
+            // 所以目标大小 = 缓冲大小 (真机: 按窗口 2688x1216 设会被再放大 1.26 倍)
+            int32_t dw = g_dst_w ? g_dst_w : (int32_t)w;
+            int32_t dh = g_dst_h ? g_dst_h : (int32_t)h;
             ARectI src{0, 0, (int32_t)w, (int32_t)h}, dst{0, 0, dw, dh};
             g_api.setGeometry(t, D->sc, &src, &dst, 0);
             g_api.setVisibility(t, D->sc, 1);
