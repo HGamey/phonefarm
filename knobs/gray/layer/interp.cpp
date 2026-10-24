@@ -91,7 +91,10 @@ struct Ring {
 };
 
 enum Kind : uint8_t { K_REAL = 0, K_SYNTH = 1 };
-struct Pending { uint32_t id; uint8_t kind; uint64_t frame, desired, target, call; };   // call = 游戏调 present 的时刻
+// call = 游戏调 present 的时刻; seq = 本层送显序号 (判相邻用, presentID 有游戏与层两套编号, 不连续)
+struct Pending { uint32_t id; uint8_t kind; uint64_t frame, desired, target, call, seq; };
+// 层自己发的 presentID 从这里起; 更小的是游戏 (Swappy) 自己的编号, 回读记录原样转交给游戏
+const uint32_t kOwnIdBase = 0x40000000u;
 
 struct Swap {
     uint32_t w = 0, h = 0, fmt = 0, usage = 0, n_images = 0;
@@ -108,9 +111,12 @@ struct Swap {
     bool phase_known = false;
     uint64_t phase_ns = 0;                // 最近一次真实显示时刻 mod refresh
     uint64_t last_target_n = 0;           // 上一张真实帧的目标显示时刻
-    uint32_t next_id = 1;
-    std::deque<Pending> pending;
-    uint32_t last_id = 0; uint8_t last_kind = K_REAL; uint64_t last_actual = 0;
+    uint32_t next_id = kOwnIdBase;
+    uint64_t next_seq = 1;
+    std::map<uint32_t, Pending> pend;      // 等回读的 presentID → 记录
+    std::deque<uint32_t> pend_order;       // 只留最近 512 条
+    std::deque<VkPastPresentationTimingGOOGLE> game_q;   // 游戏编号的回读记录, 等游戏自己来取
+    uint64_t last_seq = 0; uint8_t last_kind = K_REAL; uint64_t last_actual = 0;
     // 游戏 present 调用节奏
     uint64_t prev_call_t = 0; double ema_ns = 0;
     uint64_t synth_count = 0;
@@ -311,6 +317,23 @@ void copy_full(Dev* D, VkCommandBuffer cb, VkImage src, VkImage dst, uint32_t w,
 }
 
 // 回读真实显示时刻 (只在 pacing 下有记录)。调用方持 g_m。
+void track(Swap& S, const Pending& p) {
+    S.pend[p.id] = p;
+    S.pend_order.push_back(p.id);
+    while (S.pend_order.size() > 512) { S.pend.erase(S.pend_order.front()); S.pend_order.pop_front(); }
+}
+
+// pNext 链里游戏自己的 VkPresentTimesInfoGOOGLE (Swappy 用它定节奏、回读判断迟到), 没有返回空
+const VkPresentTimesInfoGOOGLE* game_times(const VkPresentInfoKHR* pi) {
+    struct Hdr { VkStructureType sType; const void* pNext; };
+    for (const Hdr* h = reinterpret_cast<const Hdr*>(pi->pNext); h; h = reinterpret_cast<const Hdr*>(h->pNext))
+        if (h->sType == VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE) {
+            auto t = reinterpret_cast<const VkPresentTimesInfoGOOGLE*>(h);
+            return (t->swapchainCount >= 1 && t->pTimes) ? t : nullptr;
+        }
+    return nullptr;
+}
+
 void poll_timing_locked(Dev* D, VkSwapchainKHR sc, Swap& S) {
     if (!S.timing_ok || !D->GetPastPresentationTimingGOOGLE) return;
     uint32_t n = 0;
@@ -321,15 +344,18 @@ void poll_timing_locked(Dev* D, VkSwapchainKHR sc, Swap& S) {
     const uint64_t R = S.refresh_ns;
     for (uint32_t i = 0; i < n; i++) {
         const auto& e = v[i];
+        if (e.presentID < kOwnIdBase) {   // 游戏自己的编号: 留给游戏的 vkGetPastPresentationTimingGOOGLE
+            S.game_q.push_back(e);
+            while (S.game_q.size() > 256) S.game_q.pop_front();
+        }
         if (!e.actualPresentTime) continue;
-        Pending p{e.presentID, K_REAL, 0, 0, 0, 0};
-        bool found = false;
-        while (!S.pending.empty() && S.pending.front().id < e.presentID) S.pending.pop_front();   // 回读丢了的
-        if (!S.pending.empty() && S.pending.front().id == e.presentID) { p = S.pending.front(); S.pending.pop_front(); found = true; }
-        if (!found) continue;
+        auto it = S.pend.find(e.presentID);
+        if (it == S.pend.end()) continue;
+        Pending p = it->second;
+        S.pend.erase(it);
         g_timing_samples++;
         if (R) { S.phase_ns = e.actualPresentTime % R; S.phase_known = true; }
-        if (S.last_id && e.presentID == S.last_id + 1 && e.actualPresentTime >= S.last_actual) {
+        if (S.last_seq && p.seq == S.last_seq + 1 && e.actualPresentTime >= S.last_actual) {
             uint64_t d = e.actualPresentTime - S.last_actual;
             g_disp_int.push(d);
             if (S.last_kind == K_REAL && p.kind == K_SYNTH) { g_pair_rs++; g_disp_int_rs.push(d); }
@@ -337,7 +363,7 @@ void poll_timing_locked(Dev* D, VkSwapchainKHR sc, Swap& S) {
             else if (S.last_kind == K_REAL) g_pair_rr++;
             else g_pair_ss++;
         }
-        S.last_id = e.presentID; S.last_actual = e.actualPresentTime; S.last_kind = p.kind;
+        S.last_seq = p.seq; S.last_actual = e.actualPresentTime; S.last_kind = p.kind;
         if (p.target && R) {
             if (e.actualPresentTime > p.target + R / 4) g_late++;
             else if (e.actualPresentTime + R / 4 < p.target) g_early++;
@@ -367,6 +393,23 @@ VKAPI_ATTR void VKAPI_CALL ip_GetDeviceQueue2(VkDevice dev, const VkDeviceQueueI
     else D->GetDeviceQueue2(dev, qi, q);
     if (qi && q && *q) { std::lock_guard<std::mutex> lk(g_m); D->queue_family[*q] = qi->queueFamilyIndex; }
 }
+// 层自己要回读上屏时刻, 会把驱动的记录读空; 游戏 (Swappy) 的那部分在这里原样交还, 层编号的不给它看
+VKAPI_ATTR VkResult VKAPI_CALL ip_GetPastPresentationTimingGOOGLE(VkDevice dev, VkSwapchainKHR sc, uint32_t* n,
+                                                                  VkPastPresentationTimingGOOGLE* out) {
+    std::lock_guard<std::mutex> lk(g_m);
+    Dev* D = dev_of_key(fkey(dev));
+    if (!D || !D->GetPastPresentationTimingGOOGLE) return VK_ERROR_EXTENSION_NOT_PRESENT;
+    auto it = D->swaps.find(sc);
+    if (it == D->swaps.end() || !it->second.timing_ok) return D->GetPastPresentationTimingGOOGLE(dev, sc, n, out);
+    Swap& S = it->second;
+    poll_timing_locked(D, sc, S);
+    if (!out) { *n = (uint32_t)S.game_q.size(); return VK_SUCCESS; }
+    uint32_t k = std::min<uint32_t>(*n, (uint32_t)S.game_q.size());
+    for (uint32_t i = 0; i < k; i++) { out[i] = S.game_q.front(); S.game_q.pop_front(); }
+    *n = k;
+    return S.game_q.empty() ? VK_SUCCESS : VK_INCOMPLETE;
+}
+
 VKAPI_ATTR void VKAPI_CALL ip_DestroySwapchainKHR(VkDevice dev, VkSwapchainKHR sc, const VkAllocationCallbacks* a) {
     Dev* D;
     {
@@ -587,20 +630,15 @@ VkResult ip_on_present(VkQueue q, const VkPresentInfoKHR* pi, PFN_vkQueuePresent
     if (g_mode == "real") {   // 对照: 不插帧, 只给真实帧带 presentID 回读上屏时刻 (延迟口径与插帧相同)
         poll_timing_locked(D, sc, S);
         bool timed = g_pacing && S.timing_ok;
-        uint32_t id = S.next_id++;
-        if (timed) {
-            S.pending.push_back(Pending{id, K_REAL, frame, 0, 0, t});
-            while (S.pending.size() > 512) S.pending.pop_front();
-        }
+        const VkPresentTimesInfoGOOGLE* gt = game_times(pi);
+        uint32_t id = gt ? gt->pTimes[0].presentID : S.next_id++;   // 游戏带了编号就跟着它的, 不改它的时间戳
+        if (timed) track(S, Pending{id, K_REAL, frame, gt ? gt->pTimes[0].desiredPresentTime : 0, 0, t, S.next_seq++});
         g_real++; g_real_only++;
+        if (gt) g_fb["game_present_times"]++;
         lk.unlock();
-        if (!timed) return next(q, pi);
-        struct Hdr { VkStructureType sType; const void* pNext; };
-        const void* chain = pi->pNext;
-        while (chain && reinterpret_cast<const Hdr*>(chain)->sType == VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE)
-            chain = reinterpret_cast<const Hdr*>(chain)->pNext;   // 游戏自己的时间戳在链头: 换成我们的 (desired=0 即尽快)
+        if (!timed || gt) return next(q, pi);
         VkPresentTimeGOOGLE tm{id, 0};
-        VkPresentTimesInfoGOOGLE pt{VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE, chain, 1, &tm};
+        VkPresentTimesInfoGOOGLE pt{VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE, pi->pNext, 1, &tm};
         VkPresentInfoKHR pn = *pi;
         pn.pNext = &pt;
         return next(q, &pn);
@@ -690,7 +728,14 @@ VkResult ip_on_present(VkQueue q, const VkPresentInfoKHR* pi, PFN_vkQueuePresent
     g_last_half_ns = half; g_last_period_ns = period;
     bool pace = g_pacing && S.timing_ok;
     uint64_t desiredL = 0, desiredN = 0, targetL = 0, targetN = 0;
-    if (pace) {
+    const VkPresentTimesInfoGOOGLE* gt = game_times(pi);
+    const uint64_t gdes = gt ? gt->pTimes[0].desiredPresentTime : 0;
+    if (gt) g_fb["game_present_times"]++;
+    if (pace && gdes) {   // 游戏 (Swappy) 自己定了真实帧的时刻: 不动它, 合成帧排在它前面半个游戏周期
+        desiredN = gdes; targetN = gdes + R / 2;
+        if (gdes > half + t) { desiredL = gdes - half; targetL = desiredL + R / 2; }
+        S.last_target_n = targetN;
+    } else if (pace) {
         if (S.phase_known) {
             uint64_t lead = g_lead_ns >= 0 ? (uint64_t)g_lead_ns : R;
             uint64_t from = t + lead;
@@ -702,10 +747,9 @@ VkResult ip_on_present(VkQueue q, const VkPresentInfoKHR* pi, PFN_vkQueuePresent
             S.last_target_n = targetN;
         } else g_fb["no_phase_yet"]++;   // 还没回读到真实显示时刻: 这一对不设时间戳 (ASAP), 但带 presentID 以便回读
     }
-    uint32_t idL = S.next_id++, idN = S.next_id++;
-    S.pending.push_back(Pending{idL, K_SYNTH, frame, desiredL, targetL, 0});
-    S.pending.push_back(Pending{idN, K_REAL, frame, desiredN, targetN, t});
-    while (S.pending.size() > 512) S.pending.pop_front();
+    uint32_t idL = S.next_id++, idN = gt ? gt->pTimes[0].presentID : S.next_id++;
+    track(S, Pending{idL, K_SYNTH, frame, desiredL, targetL, 0, S.next_seq++});
+    track(S, Pending{idN, K_REAL, frame, desiredN, targetN, t, S.next_seq++});
     csv_row("present", idL, K_SYNTH, frame, t, desiredL, targetL, 0, 0, 0);
     csv_row("present", idN, K_REAL, frame, t, desiredN, targetN, 0, 0, 0);
     g_real++; g_synth++;
@@ -727,7 +771,7 @@ VkResult ip_on_present(VkQueue q, const VkPresentInfoKHR* pi, PFN_vkQueuePresent
     const void* chain = pi->pNext;
     struct Hdr { VkStructureType sType; const void* pNext; };
     bool deep_times = false;
-    if (pace) {
+    if (pace && !gt) {   // 游戏没带时间戳: 真实帧挂我们的 (游戏带了就原样送它的)
         while (chain && reinterpret_cast<const Hdr*>(chain)->sType == VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE)
             chain = reinterpret_cast<const Hdr*>(chain)->pNext;   // 游戏自己的时间戳 (Swappy) 在链头: 跳过, 用我们的
         for (const Hdr* h = reinterpret_cast<const Hdr*>(chain); h; h = reinterpret_cast<const Hdr*>(h->pNext))
@@ -746,6 +790,7 @@ VkResult ip_on_present(VkQueue q, const VkPresentInfoKHR* pi, PFN_vkQueuePresent
 PFN_vkVoidFunction ip_hook(const char* name) {
     if (!g_on || !name) return nullptr;
     if (!strcmp(name, "vkGetDeviceQueue")) return reinterpret_cast<PFN_vkVoidFunction>(ip_GetDeviceQueue);
+    if (!strcmp(name, "vkGetPastPresentationTimingGOOGLE")) return reinterpret_cast<PFN_vkVoidFunction>(ip_GetPastPresentationTimingGOOGLE);
     if (!strcmp(name, "vkGetDeviceQueue2")) return reinterpret_cast<PFN_vkVoidFunction>(ip_GetDeviceQueue2);
     if (!strcmp(name, "vkDestroySwapchainKHR")) return reinterpret_cast<PFN_vkVoidFunction>(ip_DestroySwapchainKHR);
     return nullptr;
