@@ -44,7 +44,7 @@ def parse_kind(s):
         return {"kind": p[0], "downscale": None, "selfsr": None}
     if p[0] == "ip" and len(p) in (2, 3, 4):   # ip:<合成方式>[:<投帧率>[:键=值,...]]  层内插帧 (interp.cpp)
         tune = dict(kv.split("=", 1) for kv in p[3].split(",")) if len(p) == 4 and p[3] else {}
-        if any(k not in IP_TUNE for k in tune):
+        if any(k not in IP_TUNE for k in tune) or ("panel" in tune and tune["panel"] not in PANEL_MODE):
             raise argparse.ArgumentTypeError(f"ip 臂只认这些键: {IP_TUNE}")
         return {"kind": "ip", "downscale": None, "selfsr": None, "interp": p[1], "fps": p[2] if len(p) >= 3 else "",
                 "tune": tune}
@@ -175,7 +175,10 @@ def onboard(a, out, name, cold):
     return r.returncode, r.stderr[-600:]
 
 
-PANEL_KEYS = ("min_refresh_rate", "peak_refresh_rate")
+PANEL_KEYS = ("refresh_rate_mode",)
+# 红魔 system refresh_rate_mode: 1/2/3/4 = 60/90/120/144 Hz, 0 = 自动。2026-10-24 panel_probe.sh 实测原神在前台时
+# 设 4 屏幕跑 144.5 Hz; AOSP 的 min/peak_refresh_rate 设 144 无效 (仍 60 Hz)。
+PANEL_MODE = {"60": 1, "90": 2, "120": 3, "144": 4}
 PANEL_ORIG = {"path": None}   # <输出目录>/panel_orig.json: 开跑前的原值 (run 写, prepare/restore 读)
 
 
@@ -200,9 +203,9 @@ def prepare(a, k, orig_mode):
            f"setprop {IP_PROPS[2]} {shlex.quote(k.get('fps') or '')}")
     tune = k.get("tune") or {}
     dev.su("; ".join(f"setprop debug.knobs.interp_{t} {shlex.quote(str(tune.get(t, '')))}" for t in IP_TUNE if t != "panel"))
-    # panel=<Hz>: 屏幕刷新率下限/上限 (AOSP system 设置), 收尾 (restore) 按开跑前记下的原值写回
+    # panel=<Hz>: 屏幕刷新率 (红魔 refresh_rate_mode), 收尾 (restore) 按开跑前记下的原值写回
     if tune.get("panel"):
-        dev.shell(f"settings put system peak_refresh_rate {tune['panel']}; settings put system min_refresh_rate {tune['panel']}")
+        dev.shell(f"settings put system refresh_rate_mode {PANEL_MODE[str(tune['panel'])]}")
     else:
         restore_panel(dev)
     return {"game_mode": gm, "selfsr_prop": dev.prop(SR_PROP), "interp_props": [dev.prop(p) for p in IP_PROPS]}
