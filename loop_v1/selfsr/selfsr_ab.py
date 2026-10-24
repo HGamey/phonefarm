@@ -441,6 +441,7 @@ def main():
     ap.add_argument("--settle", type=float, default=20)
     ap.add_argument("--window", type=int, default=10)
     ap.add_argument("--session-seconds", type=int, default=1200)
+    ap.add_argument("--fan", action="store_true", help="整轮开机身风扇最高档 (红魔 /sys/kernel/fan), 收尾写回原值; 没有该节点的机器跳过")
     ap.add_argument("--phonefarm", default=os.environ.get("PHONEFARM_BIN") or os.path.join(REPO, "phonefarm"))
     # _locked 内部用
     ap.add_argument("--what", default=None)
@@ -527,6 +528,16 @@ def main():
     if "no intervention" not in orig_cfg.lower() and "downscale" in orig_cfg.lower():
         note(f"开跑前本包已有 Game Mode 干预, 拒绝开始 (不覆盖别人的设置): {orig_cfg[-200:]}")
         return 2
+    FAN = "/sys/kernel/fan"
+    fan_orig = None
+    if a.fan:
+        fo = dev.su(f"cat {FAN}/fan_enable {FAN}/fan_speed_level 2>/dev/null").split()
+        if len(fo) == 2:
+            fan_orig = fo
+            dev.su(f"echo 1 > {FAN}/fan_enable; echo 5 > {FAN}/fan_speed_level")
+            note(f"风扇: 原值 enable={fo[0]} level={fo[1]}, 本轮开到 1/5")
+        else:
+            note("风扇: 本机没有 /sys/kernel/fan, 跳过")
     dev.shell("settings put system screen_off_timeout 1800000")
     dev.adb(f"push {shlex.quote(os.path.join(REPO, 'loop_v1/tools/ftrace_capture.sh'))} {DEV_TRACE}", check=True)
     stop = {"flag": False}
@@ -571,6 +582,9 @@ def main():
                 break
     finally:
         r = locked("restore", "end", "native")
+        if fan_orig:
+            dev.su(f"echo {fan_orig[0]} > {FAN}/fan_enable; echo {fan_orig[1]} > {FAN}/fan_speed_level")
+            r["fan_restored"] = dev.su(f"cat {FAN}/fan_enable {FAN}/fan_speed_level").split()
         dev.shell(f"settings put system screen_off_timeout {orig_timeout}")
         ok, info = layer_absent(dev, a.pkg)
         json.dump({**r, "layer_absent": ok, "layer_info": info}, open(os.path.join(out, "restore.json"), "w"), ensure_ascii=False)
