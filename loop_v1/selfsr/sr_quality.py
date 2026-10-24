@@ -6,7 +6,7 @@
 跨冷启动的整屏 SSIM 被云、时辰、角色待机动作主导 (同为原生的相邻两臂只有 0.49–0.73), 判不了超分画质;
 这里在同一帧上比, 结果是确定性的。截图是屏幕分辨率 (HWC 放大后的 2688x1216), 先缩回游戏送显尺寸
 (--native, 缺省 2141x969) 当真值; 低分辨率输入用盒式缩小近似游戏按低分辨率渲染。
-对比三种放大: bilinear (≈ HWC 现状), lanczos (selfsr_up.comp), selfsr (selfsr_up.comp + selfsr_rcas.comp)。
+对比: bilinear (≈ HWC 现状), lanczos (selfsr_up.comp), selfsr (Lanczos2 + RCAS), selfsr_cr (Catmull-Rom + RCAS, algo=cr)。
 Python 实现与两个着色器逐项对应 (Lanczos2 4x4 + 最近 2x2 去振铃; RCAS 十字邻域、负瓣上限 0.1875 × 强度)。
 """
 import argparse, json, os, sys
@@ -46,6 +46,27 @@ def up_lanczos(src, W, H):
     return np.clip(acc / ws[..., None], lo, hi)
 
 
+def up_catmull_rom(src, W, H):
+    """Catmull-Rom 双三次 (selfsr_fused.comp algo=1 的数学等价: 9 次双线性取样 = 4x4 Catmull-Rom 权重)。"""
+    s = np.asarray(src, dtype=np.float64) / 255
+    h, w = s.shape[:2]
+    oy, ox = np.mgrid[0:H, 0:W]
+    py = (oy + 0.5) * h / H - 0.5
+    px = (ox + 0.5) * w / W - 0.5
+    by, bx = np.floor(py).astype(int), np.floor(px).astype(int)
+    fy, fx = py - by, px - bx
+
+    def cr(f):
+        return [f * (-0.5 + f * (1 - 0.5 * f)), 1 + f * f * (-2.5 + 1.5 * f), f * (0.5 + f * (2 - 1.5 * f)), f * f * (-0.5 + 0.5 * f)]
+    wx, wy = cr(fx), cr(fy)
+    acc = np.zeros((H, W, 3))
+    for j in range(4):
+        for i in range(4):
+            c = s[np.clip(by + j - 1, 0, h - 1), np.clip(bx + i - 1, 0, w - 1)]
+            acc += c * (wx[i] * wy[j])[..., None]
+    return np.clip(acc, 0, 1)
+
+
 def rcas(s, sharp):
     p = np.pad(s, ((1, 1), (1, 1), (0, 0)), mode="edge")
     c = p[1:-1, 1:-1]; n = p[:-2, 1:-1]; so = p[2:, 1:-1]; w = p[1:-1, :-2]; e = p[1:-1, 2:]
@@ -82,7 +103,9 @@ def main():
         gt = Image.open(shot).convert("RGB").resize((W, H), Image.LANCZOS)
         low = gt.resize((max(1, round(W * a.scale)), max(1, round(H * a.scale))), Image.BOX)
         lz = up_lanczos(low, W, H)
-        outs = {"bilinear": low.resize((W, H), Image.BILINEAR), "lanczos": to_img(lz), "selfsr": to_img(rcas(lz, a.sharp))}
+        cr = up_catmull_rom(low, W, H)
+        outs = {"bilinear": low.resize((W, H), Image.BILINEAR), "lanczos": to_img(lz), "selfsr": to_img(rcas(lz, a.sharp)),
+                "selfsr_cr": to_img(rcas(cr, a.sharp))}
         p_gt = os.path.join(tmp, f"{k}_gt.png"); gt.save(p_gt)
         row = {"shot": shot, "gt_sharp": lap_var(gt)}
         for name, img in outs.items():
@@ -93,7 +116,7 @@ def main():
               + " | ".join(f"{n} SSIM {row[n]['ssim']:.4f} 锐度 {row[n]['sharp']:.1f}" for n in outs))
     summ = {n: {"ssim_mean": float(np.mean([r[n]["ssim"] for r in rows])),
                 "sharp_ratio_mean": float(np.mean([r[n]["sharp"] / r["gt_sharp"] for r in rows]))}
-            for n in ("bilinear", "lanczos", "selfsr")}
+            for n in ("bilinear", "lanczos", "selfsr", "selfsr_cr")}
     res = {"scale": a.scale, "sharp": a.sharp, "native": [W, H], "n": len(rows), "summary": summ, "rows": rows}
     print(json.dumps(summ, ensure_ascii=False))
     if a.out:
