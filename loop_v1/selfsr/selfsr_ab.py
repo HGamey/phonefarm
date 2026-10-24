@@ -549,7 +549,7 @@ def main():
                 break
             k, k_str = (a.a, ka) if arm == "A" else (a.b, kb)
             name = f"{arm}{pair + 1}"
-            dev.shell("input keyevent KEYCODE_WAKEUP")
+            dev.shell("input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard")   # 无密码锁屏的机器 (荣耀) 也要解锁
             if uses_layer(k):
                 rec = arm_layer(a, out, name, k, note, lambda w, n, _k: locked(w, n, k_str))
             else:
