@@ -107,12 +107,12 @@ def ssim(png_a, png_b):
 
 def game_mode(dev, pkg, downscale, orig_mode):
     """设 Game Mode 干预; downscale=None 表示无干预。返回核对信息。"""
-    if downscale is None:
+    if downscale is None or downscale >= 1:   # >=1: 不降分辨率 (满分辨率超分只换放大)
         dev.shell(f"cmd game reset {pkg}")
         if orig_mode and orig_mode not in ("unknown", ""):
             dev.shell(f"cmd game mode {orig_mode} {pkg}")
         cfg = dev.shell(f"cmd game list-configs {pkg}")
-        return {"downscale": None, "ok": "downscale" not in cfg.lower() or "no intervention" in cfg.lower(), "configs": cfg[-300:]}
+        return {"downscale": downscale, "ok": "downscale" not in cfg.lower() or "no intervention" in cfg.lower(), "configs": cfg[-300:]}
     o1 = dev.shell(f"cmd game mode custom {pkg}")
     o2 = dev.shell(f"cmd game set --downscale {downscale} {pkg}")
     cfg = dev.shell(f"cmd game list-configs {pkg}")
