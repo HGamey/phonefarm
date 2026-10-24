@@ -10,6 +10,7 @@
   ip:<合成方式>[:<帧率>[:键=值,...]]  挂层并开层内插帧 (interp_mode=dup/dupcur/bm/real, interp_fps=给窗口投的帧率,
                       可选 pacing/stamp/acquire_ms/extra_images/lead_ns → debug.knobs.interp_<键>)
   srip:<F>:<宽>x<高>:<锐化>:<合成方式>[:<帧率>]  超分 + 插帧叠加 (第 5 步)
+  gfrc:<三位>          厂商 G-FRC+ (game_gfrc_mode 本包位, 例 101 = 只超分, 111 = 超分+插帧), 对标用
   sr:<F>:<宽>x<高>[:<锐化>]  同上降分辨率 F, 再挂层并设 debug.knobs.selfsr=<宽>x<高>[:<锐化>]: 层在送显前把游戏的小图超分到 <宽>x<高>
 每臂: (devlock 下) 设好 Game Mode 与 selfsr 属性 → 冷启动进大世界 → 静置 --settle 秒 → --window 秒窗口并行采
   - SurfaceFlinger timestats: 上屏帧率 / 刷新率 / 丢帧
@@ -27,7 +28,7 @@ import argparse, json, os, re, shlex, signal, statistics, subprocess, sys, time,
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, os.path.join(REPO, "loop_v1", "gfrc"))
-from gfrc_ab import Dev, parse_timestats, layer_src, sharpness, signflip, boot_ci  # noqa: E402
+from gfrc_ab import Dev, parse_timestats, layer_src, sharpness, signflip, boot_ci, set_pkg_bits  # noqa: E402
 
 PKG_DEFAULT = "com.miHoYo.Yuanshen"
 DEV_TRACE = "/data/local/tmp/selfsr_ftrace_capture.sh"
@@ -44,6 +45,8 @@ def parse_kind(s):
     p = s.split(":")
     if p[0] in ("native", "layer") and len(p) == 1:
         return {"kind": p[0], "downscale": None, "selfsr": None}
+    if p[0] == "gfrc" and len(p) == 2 and len(p[1]) == 3:   # gfrc:<画质档><帧率档><总开关>  厂商 G-FRC+ (对标用)
+        return {"kind": "gfrc", "downscale": None, "selfsr": None, "gfrc": p[1]}
     if p[0] == "ip" and len(p) in (2, 3, 4):   # ip:<合成方式>[:<投帧率>[:键=值,...]]  层内插帧 (interp.cpp)
         tune = dict(kv.split("=", 1) for kv in p[3].split(",")) if len(p) == 4 and p[3] else {}
         if any(k not in IP_TUNE for k in tune) or ("panel" in tune and tune["panel"] not in PANEL_MODE):
@@ -251,6 +254,10 @@ def prepare(a, k, orig_mode):
     dev.shell(f"am force-stop {a.pkg}")
     gm = game_mode(dev, a.pkg, k["downscale"], orig_mode)
     dev.su(f"setprop {SR_PROP} {shlex.quote(k['selfsr'] or '')}")
+    # 厂商 G-FRC+: 只改 settings global game_gfrc_mode 里本包那一项; 收尾写回开跑前原值 (orig.json)
+    cur = dev.shell("settings get global game_gfrc_mode").strip()
+    if cur not in ("", "null"):
+        dev.shell(f"settings put global game_gfrc_mode {shlex.quote(set_pkg_bits(cur, a.pkg, k.get('gfrc') or '000'))}")
     so = k.get("sr_opts") or {}
     dev.su("; ".join(f"setprop debug.knobs.selfsr_{o} {shlex.quote(so.get(o, ''))}" for o in SR_OPTS))
     mode = k.get("interp")
@@ -423,10 +430,17 @@ def main():
             gm = game_mode(dev, a.pkg, None, a.orig_mode)
             dev.su(f"setprop {SR_PROP} ''")
             dev.su("; ".join(f"setprop debug.knobs.selfsr_{o} ''" for o in SR_OPTS))
+            try:
+                og = json.load(open(os.path.join(out, "orig.json"))).get("game_gfrc_mode")
+            except (OSError, ValueError):
+                og = None
+            if og not in (None, "", "null"):
+                dev.shell(f"settings put global game_gfrc_mode {shlex.quote(og)}")
             dev.su("; ".join(f"setprop {p} ''" for p in IP_PROPS))
             dev.su("; ".join(f"setprop debug.knobs.interp_{t} ''" for t in IP_TUNE if t not in ("panel", "framepacing")))
             restore_panel(dev)
             rec = {"game_mode": gm, "mode_now": current_mode(dev, a.pkg), "selfsr_prop": dev.prop(SR_PROP),
+                   "game_gfrc_mode": dev.shell("settings get global game_gfrc_mode").strip(),
                    "interp_props": [dev.prop(p) for p in IP_PROPS]}
         print("ARM_JSON " + json.dumps(rec, ensure_ascii=False))
         return 0
@@ -470,6 +484,7 @@ def main():
     json.dump({**{key: dev.shell(f"settings get system {key}").strip() for key in PANEL_KEYS}, FP_PROP: dev.prop(FP_PROP)},
               open(PANEL_ORIG["path"], "w"))
     json.dump({"game_mode": orig_mode, "game_configs": orig_cfg, "selfsr_prop": orig_sr,
+               "game_gfrc_mode": dev.shell("settings get global game_gfrc_mode").strip(),
                "screen_off_timeout": orig_timeout}, open(os.path.join(out, "orig.json"), "w"), ensure_ascii=False)
     if "no intervention" not in orig_cfg.lower() and "downscale" in orig_cfg.lower():
         note(f"开跑前本包已有 Game Mode 干预, 拒绝开始 (不覆盖别人的设置): {orig_cfg[-200:]}")
