@@ -730,9 +730,15 @@ VkResult ip_on_present(VkQueue q, const VkPresentInfoKHR* pi, PFN_vkQueuePresent
         D->ResetFences(D->dev, 1, &sl.fence);
         if (D->QueueSubmit(q, 1, &sub, sl.fence) != VK_SUCCESS) { g_fb["submit_fail"]++; return bail("sc_submit"); }
         S.hist_valid = use_hist;
-        // 子图层要的是写完的缓冲: 本帧在这里等 GPU (最多 50 ms), 交出去的 acquire fence 用 -1
-        bool done = D->WaitForFences(D->dev, 1, &sl.fence, VK_TRUE, 50000000ull) == VK_SUCCESS;
-        if (!done) { sl.busy = true; g_fb["sc_gpu_wait_timeout"]++; }
+        // 子图层要等缓冲写完: 优先导出 sync fd 交给 SF (游戏线程不等); 拿不到再在这里等 GPU (最多 50 ms)
+        sl.busy = true;
+        int fence_fd = sc_export_fence(D->dev, q);
+        bool done = true;
+        if (fence_fd < 0) {
+            g_fb["sc_cpu_wait"]++;
+            done = D->WaitForFences(D->dev, 1, &sl.fence, VK_TRUE, 50000000ull) == VK_SUCCESS;
+            if (done) sl.busy = false; else g_fb["sc_gpu_wait_timeout"]++;
+        }
         S.synth_count++;
         const uint64_t R = S.refresh_ns ? S.refresh_ns : 16666667;
         uint64_t period = S.ema_ns > 0 ? (uint64_t)S.ema_ns : 2 * R;
@@ -747,7 +753,7 @@ VkResult ip_on_present(VkQueue q, const VkPresentInfoKHR* pi, PFN_vkQueuePresent
         g_cpu_us.push((now_ns() - t) / 1000);
         VkSemaphore semN = S.sems[idxN];
         lk.unlock();
-        sc_show(D->dev, show, S.w, S.h);
+        sc_show(D->dev, show, S.w, S.h, fence_fd);
         VkPresentInfoKHR pn = *pi;
         pn.waitSemaphoreCount = 1; pn.pWaitSemaphores = &semN;
         return next(q, &pn);

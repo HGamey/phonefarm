@@ -3,6 +3,7 @@
 
 #include <android/log.h>
 #include <dlfcn.h>
+#include <unistd.h>
 #include <sys/system_properties.h>
 
 #include <cstdio>
@@ -57,6 +58,7 @@ struct Api {
     void (*setDesiredPresentTime)(ASurfaceTransaction*, int64_t) = nullptr;
     void (*setZOrder)(ASurfaceTransaction*, ASurfaceControl*, int32_t) = nullptr;
     void (*reparent)(ASurfaceTransaction*, ASurfaceControl*, ASurfaceControl*) = nullptr;
+    void (*setFrameRate)(ASurfaceTransaction*, ASurfaceControl*, float, int8_t) = nullptr;   // API 30
     int32_t (*winW)(ANativeWindow*) = nullptr;
     int32_t (*winH)(ANativeWindow*) = nullptr;
     int (*ahbAlloc)(const AHardwareBuffer_Desc*, AHardwareBuffer**) = nullptr;
@@ -81,6 +83,7 @@ bool load_api() {
     SC_SYM(h, setDesiredPresentTime, "ASurfaceTransaction_setDesiredPresentTime")
     SC_SYM(h, setZOrder, "ASurfaceTransaction_setZOrder")
     SC_SYM(h, reparent, "ASurfaceTransaction_reparent")
+    SC_SYM(h, setFrameRate, "ASurfaceTransaction_setFrameRate")
     SC_SYM(nw, winW, "ANativeWindow_getWidth")
     SC_SYM(nw, winH, "ANativeWindow_getHeight")
     SC_SYM(nw, ahbAlloc, "AHardwareBuffer_allocate")
@@ -104,6 +107,10 @@ struct Dev {
     PFN_vkBindImageMemory BindImageMemory = nullptr;
     PFN_vkGetAndroidHardwareBufferPropertiesANDROID GetAhbProps = nullptr;
     PFN_vkGetPhysicalDeviceMemoryProperties gpmp = nullptr;
+    PFN_vkCreateFence CreateFence = nullptr;
+    PFN_vkDestroyFence DestroyFence = nullptr;
+    PFN_vkQueueSubmit QueueSubmit = nullptr;
+    PFN_vkGetFenceFdKHR GetFenceFd = nullptr;
     std::vector<Buf> ring;
     uint32_t w = 0, h = 0, next = 0;
     ASurfaceControl* sc = nullptr;
@@ -168,7 +175,8 @@ std::vector<const char*> sc_wanted_device_exts(const std::vector<std::string>& a
                                  VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME, VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
                                  VK_KHR_SAMPLER_YCBCR_CONVERSION_EXTENSION_NAME, VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME,
                                  VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME, VK_KHR_MAINTENANCE1_EXTENSION_NAME,
-                                 VK_KHR_BIND_MEMORY_2_EXTENSION_NAME};
+                                 VK_KHR_BIND_MEMORY_2_EXTENSION_NAME, VK_KHR_EXTERNAL_FENCE_EXTENSION_NAME,
+                                 VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME};
     for (const char* w : want) {
         bool have = false, on = false;
         for (auto& a : available) if (a == w) have = true;
@@ -201,6 +209,10 @@ void sc_on_device(VkDevice dev, VkPhysicalDevice phys, PFN_vkGetDeviceProcAddr g
     D.FreeMemory = (PFN_vkFreeMemory)gdpa(dev, "vkFreeMemory");
     D.BindImageMemory = (PFN_vkBindImageMemory)gdpa(dev, "vkBindImageMemory");
     D.GetAhbProps = (PFN_vkGetAndroidHardwareBufferPropertiesANDROID)gdpa(dev, "vkGetAndroidHardwareBufferPropertiesANDROID");
+    D.CreateFence = (PFN_vkCreateFence)gdpa(dev, "vkCreateFence");
+    D.DestroyFence = (PFN_vkDestroyFence)gdpa(dev, "vkDestroyFence");
+    D.QueueSubmit = (PFN_vkQueueSubmit)gdpa(dev, "vkQueueSubmit");
+    D.GetFenceFd = (PFN_vkGetFenceFdKHR)gdpa(dev, "vkGetFenceFdKHR");   // 没开 external_fence_fd 时为空, 退回 CPU 等
     if (!ext_enabled) g_reason = "ahb_extension_not_enabled";
     else if (!D.GetAhbProps || !gpmp) g_reason = "ahb_functions_missing";
     else if (!load_api()) {}
@@ -278,7 +290,7 @@ void sc_acquire_barrier(VkCommandBuffer cb, PFN_vkCmdPipelineBarrier bar, VkImag
 #endif
 }
 
-void sc_show(VkDevice dev, const std::vector<std::pair<ScBuf*, int64_t>>& frames, uint32_t w, uint32_t h) {
+void sc_show(VkDevice dev, const std::vector<std::pair<ScBuf*, int64_t>>& frames, uint32_t w, uint32_t h, int fence_fd) {
 #ifdef SC_HAVE_ANDROID
     std::lock_guard<std::mutex> lk(g_m);
     Dev* D = dev_of(dev);
@@ -295,18 +307,45 @@ void sc_show(VkDevice dev, const std::vector<std::pair<ScBuf*, int64_t>>& frames
             g_api.setGeometry(t, D->sc, &src, &dst, 0);
             g_api.setVisibility(t, D->sc, 1);
             if (g_api.setZOrder) g_api.setZOrder(t, D->sc, 1);
+            if (g_api.setFrameRate) g_api.setFrameRate(t, D->sc, 120.f, 0 /* DEFAULT */);
             D->geometry_set = true;
             SC_LOG("子图层几何: 源 %ux%u → 目标 %dx%d", w, h, dw, dh);
         }
-        g_api.setBuffer(t, D->sc, static_cast<AHardwareBuffer*>(frames[i].first->ahb), -1);
+        // 每个事务各拿一份 fence fd (setBuffer 接管所有权); 最后一个用原件
+        int fd = fence_fd < 0 ? -1 : (i + 1 == frames.size() ? fence_fd : dup(fence_fd));
+        g_api.setBuffer(t, D->sc, static_cast<AHardwareBuffer*>(frames[i].first->ahb), fd);
         if (frames[i].second > 0) g_api.setDesiredPresentTime(t, frames[i].second);
         g_api.txnApply(t);
         g_api.txnDelete(t);
         frames[i].first->fresh = false;
         g_txn++; g_shown++;
     }
+    if (frames.empty() && fence_fd >= 0) close(fence_fd);
 #else
-    (void)dev; (void)frames; (void)w; (void)h;
+    (void)dev; (void)frames; (void)w; (void)h; (void)fence_fd;
+#endif
+}
+
+int sc_export_fence(VkDevice dev, VkQueue q) {
+#ifdef SC_HAVE_ANDROID
+    Dev* D;
+    { std::lock_guard<std::mutex> lk(g_m); D = dev_of(dev); }
+    if (!D || !D->GetFenceFd || !D->CreateFence || !D->QueueSubmit) return -1;
+    // 空提交挂一个可导出的 fence: 同一队列上前面的提交 (层的拷贝/合成) 做完它才 signal
+    VkExportFenceCreateInfo efi{VK_STRUCTURE_TYPE_EXPORT_FENCE_CREATE_INFO, nullptr, VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT};
+    VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, &efi, 0};
+    VkFence f = VK_NULL_HANDLE;
+    if (D->CreateFence(dev, &fci, nullptr, &f) != VK_SUCCESS) return -1;
+    int fd = -1;
+    if (D->QueueSubmit(q, 0, nullptr, f) == VK_SUCCESS) {
+        VkFenceGetFdInfoKHR gi{VK_STRUCTURE_TYPE_FENCE_GET_FD_INFO_KHR, nullptr, f, VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT};
+        if (D->GetFenceFd(dev, &gi, &fd) != VK_SUCCESS) fd = -1;
+    }
+    D->DestroyFence(dev, f, nullptr);   // 只在 fd 拿到之后才销毁; 提交失败时 fence 从未入队, 可直接销毁
+    return fd;
+#else
+    (void)dev; (void)q;
+    return -1;
 #endif
 }
 
