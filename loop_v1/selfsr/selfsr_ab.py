@@ -35,7 +35,7 @@ SR_PROP = "debug.knobs.selfsr"
 # 截图 (2688x1216) 右上角那排固定图标: 整屏锐度被场景主导 (冷启动后角色/镜头可能不同), 这块内容各臂相同
 HUD_BOX = (1760, 10, 2600, 130)
 IP_PROPS = ("debug.knobs.interp", "debug.knobs.interp_mode", "debug.knobs.interp_fps")
-IP_TUNE = ("pacing", "stamp", "acquire_ms", "extra_images", "lead_ns")   # ip 臂第 4 段可设的 debug.knobs.interp_<键>
+IP_TUNE = ("pacing", "stamp", "acquire_ms", "extra_images", "lead_ns", "panel")   # panel 不是层属性, 见 prepare   # ip 臂第 4 段可设的 debug.knobs.interp_<键>
 
 
 def parse_kind(s):
@@ -175,6 +175,20 @@ def onboard(a, out, name, cold):
     return r.returncode, r.stderr[-600:]
 
 
+PANEL_KEYS = ("min_refresh_rate", "peak_refresh_rate")
+PANEL_ORIG = {"path": None}   # <输出目录>/panel_orig.json: 开跑前的原值 (run 写, prepare/restore 读)
+
+
+def restore_panel(dev):
+    try:
+        orig = json.load(open(PANEL_ORIG["path"]))
+    except (OSError, ValueError, TypeError):
+        return
+    for key in PANEL_KEYS:
+        v = orig.get(key)
+        dev.shell(f"settings delete system {key}" if v in (None, "null") else f"settings put system {key} {v}")
+
+
 def prepare(a, k, orig_mode):
     """在设备锁下调用: Game Mode 与 selfsr 属性。"""
     dev = Dev(a.serial)
@@ -185,7 +199,12 @@ def prepare(a, k, orig_mode):
     dev.su(f"setprop {IP_PROPS[0]} {'1' if mode else shlex.quote('')}; setprop {IP_PROPS[1]} {shlex.quote(mode or '')}; "
            f"setprop {IP_PROPS[2]} {shlex.quote(k.get('fps') or '')}")
     tune = k.get("tune") or {}
-    dev.su("; ".join(f"setprop debug.knobs.interp_{t} {shlex.quote(str(tune.get(t, '')))}" for t in IP_TUNE))
+    dev.su("; ".join(f"setprop debug.knobs.interp_{t} {shlex.quote(str(tune.get(t, '')))}" for t in IP_TUNE if t != "panel"))
+    # panel=<Hz>: 屏幕刷新率下限/上限 (AOSP system 设置), 收尾 (restore) 按开跑前记下的原值写回
+    if tune.get("panel"):
+        dev.shell(f"settings put system peak_refresh_rate {tune['panel']}; settings put system min_refresh_rate {tune['panel']}")
+    else:
+        restore_panel(dev)
     return {"game_mode": gm, "selfsr_prop": dev.prop(SR_PROP), "interp_props": [dev.prop(p) for p in IP_PROPS]}
 
 
@@ -310,6 +329,7 @@ def main():
     ap.add_argument("--orig-mode", default="standard")
     a = ap.parse_args()
     out = os.path.abspath(a.out)
+    PANEL_ORIG["path"] = os.path.join(out, "panel_orig.json")
     for d in ("shots", "traces", "sessions", "onboard"):
         os.makedirs(os.path.join(out, d), exist_ok=True)
 
@@ -327,7 +347,8 @@ def main():
             gm = game_mode(dev, a.pkg, None, a.orig_mode)
             dev.su(f"setprop {SR_PROP} ''")
             dev.su("; ".join(f"setprop {p} ''" for p in IP_PROPS))
-            dev.su("; ".join(f"setprop debug.knobs.interp_{t} ''" for t in IP_TUNE))
+            dev.su("; ".join(f"setprop debug.knobs.interp_{t} ''" for t in IP_TUNE if t != "panel"))
+            restore_panel(dev)
             rec = {"game_mode": gm, "mode_now": current_mode(dev, a.pkg), "selfsr_prop": dev.prop(SR_PROP),
                    "interp_props": [dev.prop(p) for p in IP_PROPS]}
         print("ARM_JSON " + json.dumps(rec, ensure_ascii=False))
@@ -369,6 +390,7 @@ def main():
     orig_cfg = dev.shell(f"cmd game list-configs {a.pkg}")
     orig_sr = dev.prop(SR_PROP)
     orig_timeout = dev.shell("settings get system screen_off_timeout").strip()
+    json.dump({key: dev.shell(f"settings get system {key}").strip() for key in PANEL_KEYS}, open(PANEL_ORIG["path"], "w"))
     json.dump({"game_mode": orig_mode, "game_configs": orig_cfg, "selfsr_prop": orig_sr,
                "screen_off_timeout": orig_timeout}, open(os.path.join(out, "orig.json"), "w"), ensure_ascii=False)
     if "no intervention" not in orig_cfg.lower() and "downscale" in orig_cfg.lower():
