@@ -514,7 +514,8 @@ def main():
     kb = raw[raw.index("--b") + 1] if "--b" in raw else "layer"
 
     def locked(what, name, k_str):
-        cmd = [os.path.join(REPO, "tools", "devlock"), "run", f"selfsr-{what}-{name}", "--", sys.executable, "-I",
+        # 标签带序列号「<标签>@<序列号>」: 看板与远程调试据此只把这一台当作测量中 (harness-ops 的约定)
+        cmd = [os.path.join(REPO, "tools", "devlock"), "run", f"selfsr-{what}-{name}@{a.serial}", "--", sys.executable, "-I",
                os.path.abspath(__file__), "_locked", "--what", what, "--name", name, "--kind", k_str,
                "--orig-mode", orig_mode, "--serial", a.serial, "--pkg", a.pkg, "--out", out,
                "--settle", str(a.settle), "--window", str(a.window), "--phonefarm", a.phonefarm]
