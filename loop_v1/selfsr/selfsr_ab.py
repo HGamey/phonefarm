@@ -151,7 +151,12 @@ def measure(dev, a, name, out):
     except ValueError:
         game = {}
     fg = dev.shell("dumpsys window | grep mCurrentFocus")
-    src = layer_src(dev.shell("dumpsys SurfaceFlinger"), a.pkg)
+    sf = dev.shell("dumpsys SurfaceFlinger")
+    src = layer_src(sf, a.pkg)
+    # 游戏图层在 SF 里的帧率票 / HWC 合成方式: 插帧时上屏率被谁限住要看这里
+    keep = [ln for i, ln in enumerate(sf.splitlines()) if a.pkg[:12] in ln or "Frame Rate" in ln or "frameRate" in ln
+            or "FrameRateOverride" in ln or "refresh" in ln.lower()][:80]
+    open(os.path.join(out, "traces", f"{name}_sf.txt"), "w").write("\n".join(keep) + "\n")
     shot = os.path.join(out, "shots", f"{name}.png")
     dev.adb(f"exec-out screencap -p > {shlex.quote(shot)}")
     span = (ts.get("displayOnTime") or a.window * 1000) / 1000
