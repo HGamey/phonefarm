@@ -7,7 +7,8 @@
   native              原生: 不挂层, Game Mode 无干预
   layer               只挂透传层 (gray-layer session --mode probe), 第 2 步用
   hwc:<F>             Android Game Mode 降分辨率 F (cmd game mode custom + cmd game set --downscale F), 放大交给 HWC
-  ip:<合成方式>[:<帧率>]  挂层并开层内插帧 (debug.knobs.interp=1, interp_mode=dup/dupcur/bm, interp_fps=给窗口投的帧率)
+  ip:<合成方式>[:<帧率>[:键=值,...]]  挂层并开层内插帧 (interp_mode=dup/dupcur/bm/real, interp_fps=给窗口投的帧率,
+                      可选 pacing/acquire_ms/extra_images/lead_ns → debug.knobs.interp_<键>)
   srip:<F>:<宽>x<高>:<锐化>:<合成方式>[:<帧率>]  超分 + 插帧叠加 (第 5 步)
   sr:<F>:<宽>x<高>[:<锐化>]  同上降分辨率 F, 再挂层并设 debug.knobs.selfsr=<宽>x<高>[:<锐化>]: 层在送显前把游戏的小图超分到 <宽>x<高>
 每臂: (devlock 下) 设好 Game Mode 与 selfsr 属性 → 冷启动进大世界 → 静置 --settle 秒 → --window 秒窗口并行采
@@ -32,14 +33,19 @@ PKG_DEFAULT = "com.miHoYo.Yuanshen"
 DEV_TRACE = "/data/local/tmp/selfsr_ftrace_capture.sh"
 SR_PROP = "debug.knobs.selfsr"
 IP_PROPS = ("debug.knobs.interp", "debug.knobs.interp_mode", "debug.knobs.interp_fps")
+IP_TUNE = ("pacing", "acquire_ms", "extra_images", "lead_ns")   # ip 臂第 4 段可设的 debug.knobs.interp_<键>
 
 
 def parse_kind(s):
     p = s.split(":")
     if p[0] in ("native", "layer") and len(p) == 1:
         return {"kind": p[0], "downscale": None, "selfsr": None}
-    if p[0] == "ip" and len(p) in (2, 3):   # ip:<合成方式>[:<投帧率>]  层内插帧 (interp.cpp), dup/dupcur/bm
-        return {"kind": "ip", "downscale": None, "selfsr": None, "interp": p[1], "fps": p[2] if len(p) == 3 else ""}
+    if p[0] == "ip" and len(p) in (2, 3, 4):   # ip:<合成方式>[:<投帧率>[:键=值,...]]  层内插帧 (interp.cpp)
+        tune = dict(kv.split("=", 1) for kv in p[3].split(",")) if len(p) == 4 and p[3] else {}
+        if any(k not in IP_TUNE for k in tune):
+            raise argparse.ArgumentTypeError(f"ip 臂只认这些键: {IP_TUNE}")
+        return {"kind": "ip", "downscale": None, "selfsr": None, "interp": p[1], "fps": p[2] if len(p) >= 3 else "",
+                "tune": tune}
     if p[0] == "hwc" and len(p) == 2:
         return {"kind": "hwc", "downscale": float(p[1]), "selfsr": None}
     if p[0] == "srip" and len(p) in (5, 6) and "x" in p[2]:   # srip:<F>:<宽>x<高>:<锐化>:<合成方式>[:<投帧率>]
@@ -176,6 +182,8 @@ def prepare(a, k, orig_mode):
     mode = k.get("interp")
     dev.su(f"setprop {IP_PROPS[0]} {'1' if mode else shlex.quote('')}; setprop {IP_PROPS[1]} {shlex.quote(mode or '')}; "
            f"setprop {IP_PROPS[2]} {shlex.quote(k.get('fps') or '')}")
+    tune = k.get("tune") or {}
+    dev.su("; ".join(f"setprop debug.knobs.interp_{t} {shlex.quote(str(tune.get(t, '')))}" for t in IP_TUNE))
     return {"game_mode": gm, "selfsr_prop": dev.prop(SR_PROP), "interp_props": [dev.prop(p) for p in IP_PROPS]}
 
 
@@ -317,6 +325,7 @@ def main():
             gm = game_mode(dev, a.pkg, None, a.orig_mode)
             dev.su(f"setprop {SR_PROP} ''")
             dev.su("; ".join(f"setprop {p} ''" for p in IP_PROPS))
+            dev.su("; ".join(f"setprop debug.knobs.interp_{t} ''" for t in IP_TUNE))
             rec = {"game_mode": gm, "mode_now": current_mode(dev, a.pkg), "selfsr_prop": dev.prop(SR_PROP),
                    "interp_props": [dev.prop(p) for p in IP_PROPS]}
         print("ARM_JSON " + json.dumps(rec, ensure_ascii=False))
