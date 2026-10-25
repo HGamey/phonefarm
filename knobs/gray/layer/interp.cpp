@@ -174,6 +174,8 @@ bool g_pacing = true;
 bool g_stamp = true;       // interp_stamp=0: 开着 display_timing 回读上屏时刻, 但不给合成/真实帧定时刻 (纯 FIFO 依次送)
 long g_lead_ns = -1;       // -1 = 一个刷新周期
 long g_sc_ring = 0;        // 子图层缓冲环张数; 0 = 4*(m+1)
+uint64_t g_sc_last = 0;    // 子图层上一张定的上屏时刻 (ns)
+uint64_t g_sc_skip = 0;    // 积压太多而不插合成帧的次数
 long g_extra_images = 2;
 long g_mult = 1;           // interp_mult: 每个真实帧之前插几张 (t = k/(mult+1)); >1 时不定显示时刻, 纯 FIFO
 long g_acquire_ms = 4;
@@ -755,12 +757,20 @@ VkResult ip_on_present(VkQueue q, const VkPresentInfoKHR* pi, PFN_vkQueuePresent
         // 第一张定在「GPU 大概写完」之后: 定在现在的话, fence 迟到时合成帧和真实帧在同一个 vsync 就绪, SF 只显示后一张
         // (真机: 游戏 53 帧时子图层只上屏 60/s, 间隔多为 16.7 ms)。缺省提前量 = 一个刷新周期
         const uint64_t t0 = now_ns() + (g_lead_ns >= 0 ? (uint64_t)g_lead_ns : R);
+        // 相邻两张至少隔一个 vsync (按投的帧率算; 没投按 120): 游戏帧时抖动时按「半个周期」排会和上一帧落进同一个 vsync,
+        // SF 只显示后一张 (真机: 120 Hz 下 30% 的间隔是 16.7 ms, 子图层只上屏 89/s)。
+        // 往后挪积压超过一个游戏周期时, 这一帧不插合成帧, 只送真实帧 (延迟不往上滚)
+        const uint64_t gap = 1000000000ull / (uint64_t)(g_fps_vote > 0 ? g_fps_vote : 120) - 300000ull;
+        auto slot = [&](uint64_t want) { uint64_t d = (g_sc_last && want < g_sc_last + gap) ? g_sc_last + gap : want; g_sc_last = d; return d; };
         std::vector<std::pair<ScBuf*, int64_t>> show;
         int shown_synth = 0;
-        for (int k = 0; k < m && synth_any && done; k++) { show.push_back({bufs[k], (int64_t)(t0 + (uint64_t)k * step)}); shown_synth++; }
-        if (done) show.push_back({rb, (int64_t)(t0 + (uint64_t)shown_synth * step)});
+        uint64_t real_at = 0;
+        const bool backlog = g_sc_last && g_sc_last + gap > t0 + period;
+        if (backlog) g_sc_skip++;
+        for (int k = 0; k < m && synth_any && done && !backlog; k++) { show.push_back({bufs[k], (int64_t)slot(t0 + (uint64_t)k * step)}); shown_synth++; }
+        if (done) { real_at = slot(t0 + (uint64_t)shown_synth * step); show.push_back({rb, (int64_t)real_at}); }
         g_real++; g_synth += shown_synth;
-        if (done) g_sc_delay.push(t0 + (uint64_t)shown_synth * step - t);
+        if (done) g_sc_delay.push(real_at - t);
         g_cpu_us.push((now_ns() - t) / 1000);
         VkSemaphore semN = S.sems[idxN];
         lk.unlock();
@@ -1052,6 +1062,7 @@ std::string ip_json() {
     j += ",\"present_margin_ns\":" + g_margin.json();
     j += ",\"real_present_to_display_ns\":" + g_lat_real.json();
     j += ",\"sc_real_sched_delay_ns\":" + g_sc_delay.json();
+    j += ",\"sc_backlog_skips\":" + std::to_string(g_sc_skip);
     j += ",\"present_call_interval_ns\":" + g_call_int.json();
     j += ",\"layer_cpu_us\":" + g_cpu_us.json();
     j += ",\"fallbacks\":{" + fb + "}";

@@ -8,8 +8,12 @@
 
 #include <cstdio>
 #include <cstring>
+#include <condition_variable>
+#include <deque>
 #include <map>
 #include <mutex>
+#include <thread>
+#include <time.h>
 
 #if __has_include(<vulkan/vulkan_android.h>) && __has_include(<android/hardware_buffer.h>)
 #include <android/hardware_buffer.h>
@@ -27,6 +31,10 @@ ANativeWindow* g_window = nullptr;
 std::string g_reason;
 uint64_t g_shown = 0, g_txn = 0, g_alloc = 0;
 int32_t g_dst_w = 0, g_dst_h = 0;
+int g_pacer = 0;               // debug.knobs.interp_sc_pacer=1: 层自己的送显线程按时 apply, 不带 desiredPresentTime
+long g_margin_ns = 3000000;    // debug.knobs.interp_sc_margin_ns: 比定的上屏时刻提前多久 apply
+uint64_t g_pacer_late = 0;     // 轮到时已经过了定的时刻
+bool g_vote_fixed = false;     // debug.knobs.interp_sc_vote=fixed
 
 bool requested() {
     if (g_req < 0) {
@@ -37,6 +45,15 @@ bool requested() {
         __system_property_get("debug.knobs.interp_sc_dst", d);   // 子图层在父图层坐标里的大小, 缺省 = 缓冲大小
         unsigned w = 0, h = 0;
         if (sscanf(d, "%ux%u", &w, &h) == 2) { g_dst_w = (int32_t)w; g_dst_h = (int32_t)h; }
+        char pc[PROP_VALUE_MAX] = {0};
+        __system_property_get("debug.knobs.interp_sc_pacer", pc);
+        g_pacer = pc[0] == '1' ? 1 : pc[0] == '2' ? 2 : 0;
+        char mg[PROP_VALUE_MAX] = {0};
+        __system_property_get("debug.knobs.interp_sc_margin_ns", mg);
+        if (mg[0]) g_margin_ns = atol(mg);
+        char vt[PROP_VALUE_MAX] = {0};
+        __system_property_get("debug.knobs.interp_sc_vote", vt);
+        g_vote_fixed = !strcmp(vt, "fixed");
     }
     return g_req == 1;
 }
@@ -59,6 +76,7 @@ struct Api {
     void (*setZOrder)(ASurfaceTransaction*, ASurfaceControl*, int32_t) = nullptr;
     void (*reparent)(ASurfaceTransaction*, ASurfaceControl*, ASurfaceControl*) = nullptr;
     void (*setFrameRate)(ASurfaceTransaction*, ASurfaceControl*, float, int8_t) = nullptr;   // API 30
+    void (*setFrameRateCS)(ASurfaceTransaction*, ASurfaceControl*, float, int8_t, int8_t) = nullptr;   // API 31
     void (*setTransparency)(ASurfaceTransaction*, ASurfaceControl*, int8_t) = nullptr;
     int32_t (*winW)(ANativeWindow*) = nullptr;
     int32_t (*winH)(ANativeWindow*) = nullptr;
@@ -80,6 +98,7 @@ bool load_api() {
     SC_SYM(h, txnApply, "ASurfaceTransaction_apply")
     SC_SYM(h, setBuffer, "ASurfaceTransaction_setBuffer")
     SC_SYM(h, setTransparency, "ASurfaceTransaction_setBufferTransparency")
+    SC_SYM(h, setFrameRateCS, "ASurfaceTransaction_setFrameRateWithChangeStrategy")
     SC_SYM(h, setVisibility, "ASurfaceTransaction_setVisibility")
     SC_SYM(h, setGeometry, "ASurfaceTransaction_setGeometry")
     SC_SYM(h, setDesiredPresentTime, "ASurfaceTransaction_setDesiredPresentTime")
@@ -292,6 +311,118 @@ void sc_acquire_barrier(VkCommandBuffer cb, PFN_vkCmdPipelineBarrier bar, VkImag
 #endif
 }
 
+#ifdef SC_HAVE_ANDROID
+// 送显线程: SF 对带 desiredPresentTime 的事务是「某一帧合成时检查哪些到点了, 同一帧到点的只取最后一张」,
+// 真机上合成帧常晚 1~2 个 vsync 或被顶掉 (帧早已画完, fence 在定的时刻前就 signal)。
+// 改为层自己在「定的时刻 − margin」才 apply, 不带 desiredPresentTime, 一张一张交。
+struct PacerJob { ASurfaceControl* sc; AHardwareBuffer* ahb; int fd; uint64_t when; };
+std::mutex g_pm;
+std::condition_variable g_pcv;
+std::deque<PacerJob> g_pq;
+bool g_pbusy = false, g_pstarted = false;
+
+uint64_t mono_ns() { timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec; }
+
+void pacer_loop() {
+    for (;;) {
+        PacerJob j;
+        {
+            std::unique_lock<std::mutex> lk(g_pm);
+            g_pcv.wait(lk, [] { return !g_pq.empty(); });
+            j = g_pq.front(); g_pq.pop_front();
+            g_pbusy = true;
+        }
+        uint64_t at = j.when > (uint64_t)g_margin_ns ? j.when - (uint64_t)g_margin_ns : 0;
+        uint64_t now = mono_ns();
+        if (at > now) {
+            timespec ts{(time_t)(at / 1000000000ull), (long)(at % 1000000000ull)};
+            clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, nullptr);
+        } else if (now > j.when) {
+            g_pacer_late++;
+        }
+        ASurfaceTransaction* t = g_api.txnCreate();
+        if (t) {
+            g_api.setBuffer(t, j.sc, j.ahb, j.fd);   // fd 归事务
+            g_api.txnApply(t);
+            g_api.txnDelete(t);
+        } else if (j.fd >= 0) {
+            close(j.fd);
+        }
+        { std::lock_guard<std::mutex> lk(g_pm); g_pbusy = false; }
+        g_pcv.notify_all();
+    }
+}
+
+// sc_pacer=2: 跟着 vsync 走。送显线程挂 AChoreographer 帧回调, 每个回调最多交一张「到点」的帧
+// (到点 = 定的上屏时刻 ≤ 本次 vsync + g_margin_ns), 从机制上保证一个 vsync 只交一张。
+struct ALooper; struct AChoreographer;
+typedef void (*ChoreoCb64)(int64_t frameTimeNanos, void* data);
+struct ChoreoApi {
+    ALooper* (*prepare)(int) = nullptr;
+    int (*pollOnce)(int, int*, int*, void**) = nullptr;
+    AChoreographer* (*instance)() = nullptr;
+    void (*post64)(AChoreographer*, ChoreoCb64, void*) = nullptr;
+} g_ch;
+AChoreographer* g_choreo = nullptr;
+uint64_t g_vsync_cb = 0, g_vsync_sent = 0;
+
+void choreo_cb(int64_t frame_ns, void*) {
+    g_vsync_cb++;
+    PacerJob j{}; bool have = false;
+    {
+        std::lock_guard<std::mutex> lk(g_pm);
+        if (!g_pq.empty() && g_pq.front().when <= (uint64_t)frame_ns + (uint64_t)g_margin_ns) {
+            j = g_pq.front(); g_pq.pop_front(); have = true; g_pbusy = true;
+        }
+    }
+    if (have) {
+        ASurfaceTransaction* t = g_api.txnCreate();
+        if (t) { g_api.setBuffer(t, j.sc, j.ahb, j.fd); g_api.txnApply(t); g_api.txnDelete(t); }
+        else if (j.fd >= 0) close(j.fd);
+        g_vsync_sent++;
+        { std::lock_guard<std::mutex> lk(g_pm); g_pbusy = false; }
+        g_pcv.notify_all();
+    }
+    g_ch.post64(g_choreo, choreo_cb, nullptr);
+}
+
+void choreo_loop() {
+    g_ch.prepare(0);
+    g_choreo = g_ch.instance();
+    if (!g_choreo) { SC_LOG("AChoreographer 拿不到, 退回睡眠送显"); g_pacer = 1; pacer_loop(); return; }
+    g_ch.post64(g_choreo, choreo_cb, nullptr);
+    for (;;) g_ch.pollOnce(-1, nullptr, nullptr, nullptr);
+}
+
+void pacer_push(const PacerJob& j) {
+    std::lock_guard<std::mutex> lk(g_pm);
+    if (!g_pstarted) {
+        if (g_pacer == 2) {
+            void* h = dlopen("libandroid.so", RTLD_NOW);
+            g_ch.prepare = reinterpret_cast<decltype(g_ch.prepare)>(dlsym(h, "ALooper_prepare"));
+            g_ch.pollOnce = reinterpret_cast<decltype(g_ch.pollOnce)>(dlsym(h, "ALooper_pollOnce"));
+            g_ch.instance = reinterpret_cast<decltype(g_ch.instance)>(dlsym(h, "AChoreographer_getInstance"));
+            g_ch.post64 = reinterpret_cast<decltype(g_ch.post64)>(dlsym(h, "AChoreographer_postFrameCallback64"));
+            if (g_ch.prepare && g_ch.pollOnce && g_ch.instance && g_ch.post64) std::thread(choreo_loop).detach();
+            else { g_pacer = 1; std::thread(pacer_loop).detach(); }
+        } else {
+            std::thread(pacer_loop).detach();
+        }
+        g_pstarted = true;
+    }
+    g_pq.push_back(j);
+    g_pcv.notify_all();
+}
+
+// 设备销毁前: 丢掉没送的, 等正在送的那张送完
+void pacer_flush() {
+    std::unique_lock<std::mutex> lk(g_pm);
+    for (auto& j : g_pq) if (j.fd >= 0) close(j.fd);
+    g_pq.clear();
+    g_pcv.wait_for(lk, std::chrono::milliseconds(200), [] { return !g_pbusy; });
+}
+#endif
+
 void sc_show(VkDevice dev, const std::vector<std::pair<ScBuf*, int64_t>>& frames, uint32_t w, uint32_t h, int fence_fd) {
 #ifdef SC_HAVE_ANDROID
     std::lock_guard<std::mutex> lk(g_m);
@@ -309,7 +440,9 @@ void sc_show(VkDevice dev, const std::vector<std::pair<ScBuf*, int64_t>>& frames
             g_api.setGeometry(t, D->sc, &src, &dst, 0);
             g_api.setVisibility(t, D->sc, 1);
             if (g_api.setZOrder) g_api.setZOrder(t, D->sc, 1);
-            if (g_api.setFrameRate) g_api.setFrameRate(t, D->sc, 120.f, 0 /* DEFAULT */);
+            // 投票: 缺省 DEFAULT; debug.knobs.interp_sc_vote=fixed 时按「固定帧率内容」投 (FIXED_SOURCE, 切换策略 ALWAYS)
+            if (g_vote_fixed && g_api.setFrameRateCS) g_api.setFrameRateCS(t, D->sc, 120.f, 1 /* FIXED_SOURCE */, 1 /* ALWAYS */);
+            else if (g_api.setFrameRate) g_api.setFrameRate(t, D->sc, 120.f, 0 /* DEFAULT */);
             // 不透明: 真实帧是从游戏 swapchain 原样拷的, alpha 不保证是 1; 不声明的话 SF 会把下面的游戏图层混进来
             // (真机: 超分 + 插帧时 HUD 出现双影、整屏发灰)
             if (g_api.setTransparency) g_api.setTransparency(t, D->sc, 2 /* ASURFACE_TRANSACTION_TRANSPARENCY_OPAQUE */);
@@ -318,10 +451,16 @@ void sc_show(VkDevice dev, const std::vector<std::pair<ScBuf*, int64_t>>& frames
         }
         // 每个事务各拿一份 fence fd (setBuffer 接管所有权); 最后一个用原件
         int fd = fence_fd < 0 ? -1 : (i + 1 == frames.size() ? fence_fd : dup(fence_fd));
+        if (g_pacer) {
+            g_api.txnApply(t);   // 只带几何 (第一次) 的事务照常交; 缓冲交给送显线程按时交
+            g_api.txnDelete(t);
+            pacer_push({D->sc, static_cast<AHardwareBuffer*>(frames[i].first->ahb), fd, (uint64_t)frames[i].second});
+        } else {
         g_api.setBuffer(t, D->sc, static_cast<AHardwareBuffer*>(frames[i].first->ahb), fd);
         if (frames[i].second > 0) g_api.setDesiredPresentTime(t, frames[i].second);
         g_api.txnApply(t);
         g_api.txnDelete(t);
+        }
         frames[i].first->fresh = false;
         g_txn++; g_shown++;
     }
@@ -360,6 +499,7 @@ void sc_on_destroy_device(VkDevice dev) {
     auto it = g_devs.find(dev);
     if (it == g_devs.end()) return;
     Dev& D = it->second;
+    pacer_flush();
     if (D.sc) {
         if (g_api.txnCreate && g_api.reparent) {   // 从窗口上摘掉子图层
             ASurfaceTransaction* t = g_api.txnCreate();
@@ -378,9 +518,9 @@ void sc_on_destroy_device(VkDevice dev) {
 
 std::string sc_json() {
     std::lock_guard<std::mutex> lk(g_m);
-    char b[256];
-    snprintf(b, sizeof b, "{\"requested\":%s,\"window\":%s,\"shown\":%llu,\"buffers_allocated\":%llu,\"reason\":\"%s\"}",
+    char b[400];
+    snprintf(b, sizeof b, "{\"requested\":%s,\"window\":%s,\"shown\":%llu,\"buffers_allocated\":%llu,\"pacer\":%d,\"margin_ns\":%ld,\"pacer_late\":%llu,\"vsync_cb\":%llu,\"vsync_sent\":%llu,\"reason\":\"%s\"}",
              g_req == 1 ? "true" : "false", g_window ? "true" : "false", (unsigned long long)g_shown,
-             (unsigned long long)g_alloc, g_reason.c_str());
+             (unsigned long long)g_alloc, g_pacer, g_margin_ns, (unsigned long long)g_pacer_late, (unsigned long long)g_vsync_cb, (unsigned long long)g_vsync_sent, g_reason.c_str());
     return b;
 }
