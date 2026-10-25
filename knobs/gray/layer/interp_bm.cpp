@@ -54,6 +54,7 @@ struct Res {
     VkImageView C_view = VK_NULL_HANDLE, O_view = VK_NULL_HANDLE;
     VkImageView H_view = VK_NULL_HANDLE;   // 历史图 H 的视图 (H 变了就重建)
     VkImage H_for_view = VK_NULL_HANDLE;
+    uint64_t H_gen = 0;
     VkBuffer l0 = VK_NULL_HANDLE, l1 = VK_NULL_HANDLE, mv = VK_NULL_HANDLE, flow = VK_NULL_HANDLE,
              res = VK_NULL_HANDLE, hud = VK_NULL_HANDLE;
     VkSampler sampler = VK_NULL_HANDLE;
@@ -233,12 +234,15 @@ bool synth_bm(const IpSynthCtx& c, void*) {
         if (!R.ok) BM_LOG("建资源失败, 退回 dup");
     }
     if (!R.ok) { g_declined++; return false; }
-    if (R.H_for_view != c.prev) {   // 历史图换了 (swapchain 重建): 新视图
+    // 历史图换了 (swapchain 重建): 新视图。只比句柄不够: 销毁重建后句柄值可能一样, 旧视图还指着旧图的尺寸
+    // (真机: 超分 + 插帧时合成帧混进一张放大 1.26 倍的画面)
+    if (R.H_for_view != c.prev || R.H_gen != c.prev_gen) {
         VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         vci.image = c.prev; vci.viewType = VK_IMAGE_VIEW_TYPE_2D; vci.format = VK_FORMAT_R8G8B8A8_UNORM;
         vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         if (f.CreateImageView(c.dev, &vci, nullptr, &R.H_view) != VK_SUCCESS) { g_declined++; return false; }
-        R.H_for_view = c.prev;
+        // 旧视图不销毁: 子图层后端不在 CPU 上等 GPU, 可能还有提交在用它 (swapchain 重建才走到这里, 漏一个视图可接受)
+        R.H_for_view = c.prev; R.H_gen = c.prev_gen;
         write_img(c.dev, f, R.luma.set, 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, R.sampler, R.H_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         write_img(c.dev, f, R.compose.set, 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, R.sampler, R.H_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     }

@@ -59,6 +59,7 @@ struct Api {
     void (*setZOrder)(ASurfaceTransaction*, ASurfaceControl*, int32_t) = nullptr;
     void (*reparent)(ASurfaceTransaction*, ASurfaceControl*, ASurfaceControl*) = nullptr;
     void (*setFrameRate)(ASurfaceTransaction*, ASurfaceControl*, float, int8_t) = nullptr;   // API 30
+    void (*setTransparency)(ASurfaceTransaction*, ASurfaceControl*, int8_t) = nullptr;
     int32_t (*winW)(ANativeWindow*) = nullptr;
     int32_t (*winH)(ANativeWindow*) = nullptr;
     int (*ahbAlloc)(const AHardwareBuffer_Desc*, AHardwareBuffer**) = nullptr;
@@ -78,6 +79,7 @@ bool load_api() {
     SC_SYM(h, txnDelete, "ASurfaceTransaction_delete")
     SC_SYM(h, txnApply, "ASurfaceTransaction_apply")
     SC_SYM(h, setBuffer, "ASurfaceTransaction_setBuffer")
+    SC_SYM(h, setTransparency, "ASurfaceTransaction_setBufferTransparency")
     SC_SYM(h, setVisibility, "ASurfaceTransaction_setVisibility")
     SC_SYM(h, setGeometry, "ASurfaceTransaction_setGeometry")
     SC_SYM(h, setDesiredPresentTime, "ASurfaceTransaction_setDesiredPresentTime")
@@ -308,6 +310,9 @@ void sc_show(VkDevice dev, const std::vector<std::pair<ScBuf*, int64_t>>& frames
             g_api.setVisibility(t, D->sc, 1);
             if (g_api.setZOrder) g_api.setZOrder(t, D->sc, 1);
             if (g_api.setFrameRate) g_api.setFrameRate(t, D->sc, 120.f, 0 /* DEFAULT */);
+            // 不透明: 真实帧是从游戏 swapchain 原样拷的, alpha 不保证是 1; 不声明的话 SF 会把下面的游戏图层混进来
+            // (真机: 超分 + 插帧时 HUD 出现双影、整屏发灰)
+            if (g_api.setTransparency) g_api.setTransparency(t, D->sc, 2 /* ASURFACE_TRANSACTION_TRANSPARENCY_OPAQUE */);
             D->geometry_set = true;
             SC_LOG("子图层几何: 源 %ux%u → 目标 %dx%d", w, h, dw, dh);
         }

@@ -46,6 +46,7 @@ struct IpSynthCtx {
     VkQueue queue = VK_NULL_HANDLE;       // 游戏 present 用的队列 (同一条)
     VkCommandBuffer cb = VK_NULL_HANDLE;  // 已 Begin, 由层 End + 提交
     VkImage prev = VK_NULL_HANDLE, cur = VK_NULL_HANDLE, dst = VK_NULL_HANDLE;
+    uint64_t prev_gen = 0;                // prev 每重建一次加 1 (句柄值可能被复用, 合成方式靠它判断视图要不要重建)
     uint32_t w = 0, h = 0, fmt = 0;       // VkFormat
     uint32_t swap_usage = 0;              // swapchain 图实际的 VkImageUsageFlags
     uint32_t queue_family = 0;

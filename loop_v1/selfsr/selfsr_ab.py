@@ -39,7 +39,7 @@ UNLIMIT_PROP = "debug.knobs.unlimit"
 # 截图 (2688x1216) 右上角那排固定图标: 整屏锐度被场景主导 (冷启动后角色/镜头可能不同), 这块内容各臂相同
 HUD_BOX = (1760, 10, 2600, 130)
 IP_PROPS = ("debug.knobs.interp", "debug.knobs.interp_mode", "debug.knobs.interp_fps")
-IP_TUNE = ("pacing", "stamp", "acquire_ms", "extra_images", "lead_ns", "mult", "backend", "sc_dst", "panel", "framepacing",
+IP_TUNE = ("sc_ring", "pacing", "stamp", "acquire_ms", "extra_images", "lead_ns", "mult", "backend", "sc_dst", "panel", "framepacing",
            "unlimit")
 FP_PROP = "vendor.perf.framepacing.enable"   # 高通 perf HAL 的游戏帧节奏; framepacing=<值> 进世界后设, 收尾写回原值   # panel 不是层属性, 见 prepare   # ip 臂第 4 段可设的 debug.knobs.interp_<键>
 
@@ -161,6 +161,30 @@ def timestats_layer(text, needle):
     return g
 
 
+def sc_layer_fps(dev, windows=6, raw_path=None):
+    """插帧子图层 (selfsr_interp) 的实际上屏帧率: SF --latency 的 actual-present 列, 每段 1 s (缓冲只存 128 帧)。
+    timestats 不收这个子图层, 只能这样量。返回 {fps, interval_p50_ms, interval_p95_ms} 或 {}。"""
+    out = dev.shell("N=$(dumpsys SurfaceFlinger --list | grep -o 'selfsr_interp#[0-9]*' | tail -1); [ -n \"$N\" ] || exit 0; "
+                    f"for i in $(seq {windows}); do dumpsys SurfaceFlinger --latency-clear >/dev/null; sleep 1; "
+                    "echo ===; dumpsys SurfaceFlinger --latency \"$N\"; done; echo '### mode'; "
+                    "dumpsys SurfaceFlinger | grep -iE 'activeMode|renderRate|vsyncRate|desiredMode' | head -12; "
+                    "settings get system refresh_rate_mode", timeout=windows * 4 + 30)
+    if raw_path:
+        open(raw_path, "w").write(out)
+    out = out.split("### mode")[0]
+    fps, iv = [], []
+    for blk in out.split("===")[1:]:
+        ts = sorted(int(r[1]) for r in (ln.split() for ln in blk.splitlines()) if len(r) == 3 and 0 < int(r[1]) < 9e18)
+        if len(ts) > 2:
+            fps.append((len(ts) - 1) / ((ts[-1] - ts[0]) / 1e9))
+            iv += [(b - x) / 1e6 for x, b in zip(ts, ts[1:])]
+    if not fps:
+        return {}
+    iv.sort()
+    return {"fps": round(statistics.mean(fps), 2), "interval_p50_ms": round(iv[len(iv) // 2], 2),
+            "interval_p95_ms": round(iv[int(len(iv) * 0.95)], 2)}
+
+
 def measure(dev, a, name, out):
     dev_trace = f"/data/local/tmp/selfsr_trace_{name}.txt"
     ts_cmd = ("dumpsys SurfaceFlinger --timestats -disable -clear >/dev/null; "
@@ -174,6 +198,7 @@ def measure(dev, a, name, out):
     ts = parse_timestats(ts_text, a.pkg)
     ts_sc = timestats_layer(ts_text, "selfsr_interp")   # 插帧子图层后端的图层
     tr.wait(timeout=a.window + 90)
+    sc = sc_layer_fps(dev, raw_path=os.path.join(out, "traces", f"{name}_sclat.txt"))
     local_trace = os.path.join(out, "traces", f"{name}.txt")
     dev.adb(f"exec-out su -c {shlex.quote('cat ' + dev_trace)} > {shlex.quote(local_trace)}")
     dev.su(f"rm -f {dev_trace}")
@@ -195,8 +220,9 @@ def measure(dev, a, name, out):
     return {"in_game": a.pkg in fg,
             "display_fps": round(ts["layer_frames"] / span, 2) if ts.get("layer_frames") else None,
             "display_hz": ts.get("display_hz"), "missed_frames": ts.get("missedFrames"),
-            "display_fps_sc": round(ts_sc["layer_frames"] / ((ts_sc.get("displayOnTime") or a.window * 1000) / 1000), 2)
-                              if ts_sc.get("layer_frames") else None,
+            "display_fps_sc": sc.get("fps") or (round(ts_sc["layer_frames"] / ((ts_sc.get("displayOnTime") or a.window * 1000) / 1000), 2)
+                                                if ts_sc.get("layer_frames") else None),
+            "sc_interval_p95_ms": sc.get("interval_p95_ms"),
             "game_fps": game.get("fps_mean"), "game_frame_p95_ms": game.get("frame_p95"),
             "gpu_active_ms": game.get("gpu_active_mean"),
             "out_res": src, "sharp_full": sharpness(shot), "sharp_hud": sharpness(shot, HUD_BOX), "shot": shot}

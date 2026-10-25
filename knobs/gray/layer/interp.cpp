@@ -104,6 +104,7 @@ struct Swap {
     std::vector<VkImage> imgs;
     std::vector<VkSemaphore> sems;        // 一张图一个: 层提交 → 这张图的 present
     VkImage hist = VK_NULL_HANDLE;        // 历史图 H (上一张真实帧), 层自有
+    uint64_t hist_gen = 0;                // 全局唯一的 H 代号 (见 IpSynthCtx::prev_gen)
     VkDeviceMemory hist_mem = VK_NULL_HANDLE;
     bool hist_valid = false;              // H 里有没有内容 (第一帧没有)
     // 节奏
@@ -172,6 +173,7 @@ std::string g_mode = "dup";
 bool g_pacing = true;
 bool g_stamp = true;       // interp_stamp=0: 开着 display_timing 回读上屏时刻, 但不给合成/真实帧定时刻 (纯 FIFO 依次送)
 long g_lead_ns = -1;       // -1 = 一个刷新周期
+long g_sc_ring = 0;        // 子图层缓冲环张数; 0 = 4*(m+1)
 long g_extra_images = 2;
 long g_mult = 1;           // interp_mult: 每个真实帧之前插几张 (t = k/(mult+1)); >1 时不定显示时刻, 纯 FIFO
 long g_acquire_ms = 4;
@@ -270,7 +272,9 @@ uint32_t pick_device_local(Dev* D, uint32_t bits) {
     return UINT32_MAX;
 }
 
+uint64_t g_hist_gen = 0;
 bool create_hist(Dev* D, Swap& S) {
+    S.hist_gen = ++g_hist_gen;
     VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ici.imageType = VK_IMAGE_TYPE_2D; ici.format = (VkFormat)S.fmt; ici.extent = {S.w, S.h, 1};
     ici.mipLevels = 1; ici.arrayLayers = 1; ici.samples = VK_SAMPLE_COUNT_1_BIT; ici.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -449,6 +453,7 @@ bool ip_init_from_props() {
     std::string st = prop("debug.knobs.interp_stamp");
     g_stamp = st.empty() || st[0] == '1';
     g_lead_ns = prop_long("debug.knobs.interp_lead_ns", -1, -1, 200000000);
+    g_sc_ring = prop_long("debug.knobs.interp_sc_ring", 0, 0, 64);
     g_mult = prop_long("debug.knobs.interp_mult", 1, 1, kMaxMult);
     g_extra_images = prop_long("debug.knobs.interp_extra_images", g_mult + 1, 1, kMaxMult + 1);
     g_acquire_ms = prop_long("debug.knobs.interp_acquire_ms", 4, 0, 100);
@@ -681,7 +686,7 @@ VkResult ip_on_present(VkQueue q, const VkPresentInfoKHR* pi, PFN_vkQueuePresent
         const int m = (int)g_mult;
         std::vector<ScBuf*> bufs;
         for (int k = 0; k <= m; k++) {
-            ScBuf* b = sc_next_buffer(D->dev, S.w, S.h, (uint32_t)(4 * (m + 1)));
+            ScBuf* b = sc_next_buffer(D->dev, S.w, S.h, g_sc_ring > m ? (uint32_t)g_sc_ring : (uint32_t)(4 * (m + 1)));
             if (!b) break;
             bufs.push_back(b);
         }
@@ -701,7 +706,7 @@ VkResult ip_on_present(VkQueue q, const VkPresentInfoKHR* pi, PFN_vkQueuePresent
             bool custom = false;
             if (reg != registry().end()) {
                 IpSynthCtx cx;
-                cx.dev = D->dev; cx.queue = q; cx.cb = sl.cb; cx.prev = S.hist; cx.cur = N; cx.dst = b->img;
+                cx.dev = D->dev; cx.queue = q; cx.cb = sl.cb; cx.prev_gen = S.hist_gen; cx.prev = S.hist; cx.cur = N; cx.dst = b->img;
                 cx.w = S.w; cx.h = S.h; cx.fmt = S.fmt; cx.swap_usage = S.usage; cx.queue_family = family; cx.frame = frame;
                 cx.gdpa = D->gdpa; cx.t = (float)(k + 1) / (float)(m + 1); cx.sub = (uint32_t)k; cx.subs = (uint32_t)m;
                 custom = reg->second.fn(cx, reg->second.user);
@@ -746,7 +751,9 @@ VkResult ip_on_present(VkQueue q, const VkPresentInfoKHR* pi, PFN_vkQueuePresent
         // (那时屏幕可能还是 60 Hz, 真机: 游戏 57 帧 + 下限 16.6 ms → 积压, 子图层只上屏 60/s)
         uint64_t step = period / (uint64_t)(m + 1);
         if (step < 2000000ull) step = 2000000ull;
-        const uint64_t t0 = now_ns();
+        // 第一张定在「GPU 大概写完」之后: 定在现在的话, fence 迟到时合成帧和真实帧在同一个 vsync 就绪, SF 只显示后一张
+        // (真机: 游戏 53 帧时子图层只上屏 60/s, 间隔多为 16.7 ms)。缺省提前量 = 一个刷新周期
+        const uint64_t t0 = now_ns() + (g_lead_ns >= 0 ? (uint64_t)g_lead_ns : R);
         std::vector<std::pair<ScBuf*, int64_t>> show;
         int shown_synth = 0;
         for (int k = 0; k < m && synth_any && done; k++) { show.push_back({bufs[k], (int64_t)(t0 + (uint64_t)k * step)}); shown_synth++; }
@@ -798,7 +805,7 @@ VkResult ip_on_present(VkQueue q, const VkPresentInfoKHR* pi, PFN_vkQueuePresent
             bool custom = false;
             if (reg != registry().end()) {
                 IpSynthCtx cx;
-                cx.dev = D->dev; cx.queue = q; cx.cb = sl.cb; cx.prev = S.hist_valid ? S.hist : VK_NULL_HANDLE; cx.cur = N; cx.dst = L;
+                cx.dev = D->dev; cx.queue = q; cx.cb = sl.cb; cx.prev_gen = S.hist_gen; cx.prev = S.hist_valid ? S.hist : VK_NULL_HANDLE; cx.cur = N; cx.dst = L;
                 cx.w = S.w; cx.h = S.h; cx.fmt = S.fmt; cx.swap_usage = S.usage; cx.queue_family = family; cx.frame = frame;
                 cx.gdpa = D->gdpa; cx.t = (float)(k + 1) / (float)(got + 1); cx.sub = (uint32_t)k; cx.subs = (uint32_t)got;
                 custom = reg->second.fn(cx, reg->second.user);
