@@ -487,6 +487,9 @@ def arm_layer(a, out, name, k, note, locked):
             lat = ipj.get("real_present_to_display_ns") or {}
             # 真实帧 present→上屏 (整个会话累计); 插帧带来的延迟 = 与 ip:real 对照臂之差
             rec["display_latency_p50_ms"] = round(lat["p50"] / 1e6, 3) if lat.get("p50") else None
+            sd = ipj.get("sc_real_sched_delay_ns") or {}
+            # 子图层后端: 真实帧被排到「present 调用之后多久」上屏 (提前量 + 合成帧占的半个周期), 是插帧加的延迟的下限
+            rec["sc_added_delay_p50_ms"] = round(sd["p50"] / 1e6, 2) if sd.get("p50") else None
         if not rec["layer_loaded"]:
             rec["error"] = "层没加载 (marker layer_loaded 不为真)"
     finally:
@@ -706,7 +709,7 @@ def main():
     good = [r for r in arms if not r.get("error") and r.get("in_game")
             and (not uses_layer(parse_kind(r["kind"])) or (r.get("layer_loaded") and r.get("layer_removed")))]
     pairs = sorted({r["pair"] for r in good if sum(1 for x in good if x["pair"] == r["pair"]) == 2})
-    metrics = ["display_fps", "display_fps_sc", "game_fps", "game_frame_p95_ms", "gpu_active_ms", "sharp_full", "sharp_hud", "ssim_vs_native_ref", "missed_frames",
+    metrics = ["display_fps", "display_fps_sc", "sc_added_delay_p50_ms", "sc_interval_p95_ms", "game_fps", "game_frame_p95_ms", "gpu_active_ms", "sharp_full", "sharp_hud", "ssim_vs_native_ref", "missed_frames",
                "display_latency_p50_ms", "displayed_per_s"]
     res = {}
     for m in metrics:
@@ -725,7 +728,7 @@ def main():
               "out_res": {side: sorted({tuple(r["out_res"]) for r in good if r["side"] == side and r.get("out_res")}) for side in "AB"},
               "metrics": res, "min_p_possible": 2 / 2 ** len(pairs) if pairs else None}
     json.dump(report, open(os.path.join(out, "report.json"), "w"), ensure_ascii=False, indent=1)
-    names = {"display_fps": "上屏帧率", "display_fps_sc": "子图层上屏帧率 (插帧 sc 后端)", "game_fps": "游戏渲染帧率 (GPU 提交)", "game_frame_p95_ms": "游戏渲染 p95 帧时 (ms)",
+    names = {"display_fps": "上屏帧率", "display_fps_sc": "子图层上屏帧率 (插帧 sc 后端)", "sc_added_delay_p50_ms": "插帧给真实帧加的排队延迟 p50 (ms)", "sc_interval_p95_ms": "子图层上屏间隔 p95 (ms)", "game_fps": "游戏渲染帧率 (GPU 提交)", "game_frame_p95_ms": "游戏渲染 p95 帧时 (ms)",
              "gpu_active_ms": "每帧 GPU 忙碌 (ms, 均值)",
              "display_latency_p50_ms": "真实帧 present→上屏 p50 (ms)",
              "displayed_per_s": "层回读: 窗口内每秒实际上屏 (真实+合成)",

@@ -190,6 +190,7 @@ uint64_t g_real = 0, g_synth = 0, g_real_only = 0;
 std::map<std::string, uint64_t> g_fb;  // fallback 原因
 uint64_t g_late = 0, g_early = 0, g_timing_samples = 0;
 uint64_t g_pair_rs = 0, g_pair_sr = 0, g_pair_rr = 0, g_pair_ss = 0;   // 相邻显示帧的种类组合
+Ring g_sc_delay;   // 子图层后端: 真实帧「游戏调 present → 定的上屏时刻」(ns), 即插帧给真实帧加的排队延迟
 Ring g_disp_int, g_disp_int_rs, g_disp_int_sr, g_call_int, g_cpu_us, g_margin;
 Ring g_lat_real;   // 真实帧: 游戏调 present → 实际上屏 (插帧带来的显示延迟看它与 real 模式之差)
 uint64_t g_last_half_ns = 0, g_last_period_ns = 0;
@@ -759,6 +760,7 @@ VkResult ip_on_present(VkQueue q, const VkPresentInfoKHR* pi, PFN_vkQueuePresent
         for (int k = 0; k < m && synth_any && done; k++) { show.push_back({bufs[k], (int64_t)(t0 + (uint64_t)k * step)}); shown_synth++; }
         if (done) show.push_back({rb, (int64_t)(t0 + (uint64_t)shown_synth * step)});
         g_real++; g_synth += shown_synth;
+        if (done) g_sc_delay.push(t0 + (uint64_t)shown_synth * step - t);
         g_cpu_us.push((now_ns() - t) / 1000);
         VkSemaphore semN = S.sems[idxN];
         lk.unlock();
@@ -1049,6 +1051,7 @@ std::string ip_json() {
     j += ",\"displayed_interval_synth_to_real_ns\":" + g_disp_int_sr.json();
     j += ",\"present_margin_ns\":" + g_margin.json();
     j += ",\"real_present_to_display_ns\":" + g_lat_real.json();
+    j += ",\"sc_real_sched_delay_ns\":" + g_sc_delay.json();
     j += ",\"present_call_interval_ns\":" + g_call_int.json();
     j += ",\"layer_cpu_us\":" + g_cpu_us.json();
     j += ",\"fallbacks\":{" + fb + "}";
