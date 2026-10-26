@@ -501,6 +501,12 @@ def arm_layer(a, out, name, k, note, locked):
         t0 = uptime_ns(dev)
         rec.update(measure(dev, a, name, out))
         t1 = uptime_ns(dev)
+        if panel:   # 窗口结束再回读一次: 系统可能在窗口中途把刷新率压回去 (真机: 开始 120 Hz, 窗口内降到 60, 子图层只上屏 60)
+            per = dev.shell("dumpsys SurfaceFlinger | grep -m1 mPeriod")
+            rec["panel_period_end"] = per.strip()
+            m = re.search(r"\(([0-9.]+) fps\)", per)
+            if not m or abs(float(m.group(1)) - float(panel)) > 3 or rec.get("display_hz") not in (None, int(panel)):
+                rec["error"] = f"测量窗口内屏幕没保持 {panel} Hz: 结束时 {per.strip()}, timestats {rec.get('display_hz')} Hz"
         m1 = marker()
         if k["kind"] in ("ip", "srip"):   # 窗口内层回读的实际上屏 (会话累计的环形统计混着加载期, 不可用)
             rec["interp_window"] = interp_window(dev, a, name, out, t0, t1)
