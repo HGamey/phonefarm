@@ -732,10 +732,42 @@ static void unlimit_init() {
     if (!g_fps_cfg_get) g_unlimit_reason = "no_FpsControlConfig";
     __android_log_print(ANDROID_LOG_INFO, "refknobs", "unlimit=1: FpsControlConfig::getGlobalConfig %s", g_fps_cfg_get ? "找到" : "没有");
 }
+// debug.knobs.unlimit_dump=1: 第一次送显时把 FpsControlConfig 的 toString 和前 0x100 字节打进 logcat (找 IFAS 等字段的偏移)
+static std::string json_escape_str(const std::string& in) {
+    std::string o; for (char c : in) { if (c == '"' || c == '\\') { o += '\\'; o += c; } else if ((unsigned char)c < 0x20) o += ' '; else o += c; } return o;
+}
+static std::string g_cfg_str, g_cfg_hex;   // unlimit_dump 的结果, 也进 marker
+static void unlimit_dump(char* cfg) {
+    static bool done = false;
+    if (done || !read_bool_prop("debug.knobs.unlimit_dump")) return;
+    done = true;
+    auto to_str = reinterpret_cast<void (*)(void*, std::string&)>(sym_from_loaded("libgui.so",
+        "_ZN7android16FpsControlConfig8toStringERNSt3__112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEE"));
+    if (to_str) { std::string out; to_str(cfg, out); g_cfg_str = out; __android_log_print(ANDROID_LOG_INFO, "refknobs", "FpsControlConfig: %s", out.c_str()); }
+    char hex[0x100 * 3 + 1] = {0};
+    for (int i = 0; i < 0x100; i++) snprintf(hex + i * 3, 4, "%02x ", (unsigned char)cfg[i]);
+    g_cfg_hex = hex;
+    __android_log_print(ANDROID_LOG_INFO, "refknobs", "FpsControlConfig bytes: %s", hex);
+}
 static void unlimit_on_present() {
     if (!g_fps_cfg_get) return;
     char* cfg = static_cast<char*>(g_fps_cfg_get());
     if (!cfg) return;
+    unlimit_dump(cfg);
+    // debug.knobs.unlimit_poke="0x20:0,0x80:120": 每次送显前把配置里这些偏移的 int 改成给定值 (RedMagicOS 11 实测布局:
+    // 0x20 FpsControl 总开关, 0x60 Limited Frame, 0x80 Ceiling, 0x88 Floor)
+    static std::vector<std::pair<int, int>> pokes;
+    static bool pokes_read = false;
+    if (!pokes_read) {
+        pokes_read = true;
+        char v[PROP_VALUE_MAX] = {0};
+        __system_property_get("debug.knobs.unlimit_poke", v);
+        for (char* tok = strtok(v, ","); tok; tok = strtok(nullptr, ",")) {
+            int off = 0, val = 0;
+            if (sscanf(tok, "%i:%i", &off, &val) == 2 && off >= 0 && off <= 0xfc && off % 4 == 0) pokes.push_back({off, val});
+        }
+    }
+    for (auto& pk : pokes) *reinterpret_cast<int*>(cfg + pk.first) = pk.second;
     int* lim = reinterpret_cast<int*>(cfg + 0x60);
     int v = *lim;
     if (v != 0) { g_unlimit_seen = v; *lim = 0; g_unlimit_cleared++; }
@@ -866,7 +898,7 @@ static void write_marker() {
     if (sr_on()) json += ",\"selfsr\":" + sr_json();       // 送显前超分 (selfsr.cpp)
     if (g_unlimit) json += ",\"unlimit\":{\"symbol\":" + std::string(g_fps_cfg_get ? "true" : "false") + ",\"last_seen\":" +
                            std::to_string(g_unlimit_seen.load()) + ",\"cleared\":" + std::to_string(g_unlimit_cleared.load()) +
-                           ",\"reason\":\"" + g_unlimit_reason + "\"}";
+                           ",\"reason\":\"" + g_unlimit_reason + "\",\"cfg_hex\":\"" + g_cfg_hex + "\",\"cfg_str\":\"" + json_escape_str(g_cfg_str) + "\"}";
     json += "}";
 
     // 通道 1: logcat (root 可读, 不受目标应用存储沙箱影响)。
