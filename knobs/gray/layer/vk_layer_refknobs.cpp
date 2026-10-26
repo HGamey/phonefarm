@@ -18,6 +18,8 @@
 #include <android/log.h>
 #include <atomic>
 #include <dlfcn.h>
+#include <elf.h>
+#include <link.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -681,12 +683,52 @@ static std::atomic<uint64_t> g_unlimit_cleared{0};
 static std::atomic<int> g_unlimit_seen{-1};
 static std::string g_unlimit_reason;
 static void* (*g_fps_cfg_get)() = nullptr;
+// 按应用方式加载的层 (gpu_debug_app, 不 root) 在应用的链接器命名空间里, dlopen("libgui.so") 拿不到系统内部库。
+// 退路: dl_iterate_phdr 找到进程里已加载的 libgui 的装载偏移, 再从磁盘读它的 .dynsym 找符号 (系统库对应用可读)。
+struct LoadedLib { const char* want; std::string path; uintptr_t base = 0; };
+static int find_loaded_cb(dl_phdr_info* info, size_t, void* data) {
+    auto* L = static_cast<LoadedLib*>(data);
+    const char* n = info->dlpi_name;
+    if (!n) return 0;
+    const char* slash = strrchr(n, '/');
+    if (!strcmp(slash ? slash + 1 : n, L->want)) { L->path = n; L->base = info->dlpi_addr; return 1; }
+    return 0;
+}
+static void* sym_from_loaded(const char* lib, const char* sym) {
+    LoadedLib L{lib};
+    dl_iterate_phdr(find_loaded_cb, &L);
+    if (!L.base || L.path.empty()) return nullptr;
+    FILE* f = fopen(L.path.c_str(), "rb");
+    if (!f) return nullptr;
+    void* found = nullptr;
+    Elf64_Ehdr eh;
+    if (fread(&eh, sizeof eh, 1, f) == 1 && !memcmp(eh.e_ident, ELFMAG, SELFMAG) && eh.e_shentsize == sizeof(Elf64_Shdr)) {
+        std::vector<Elf64_Shdr> sh(eh.e_shnum);
+        if (!fseek(f, (long)eh.e_shoff, SEEK_SET) && fread(sh.data(), sizeof(Elf64_Shdr), sh.size(), f) == sh.size()) {
+            for (auto& s : sh) {
+                if (s.sh_type != SHT_DYNSYM || s.sh_link >= sh.size()) continue;
+                const Elf64_Shdr& st = sh[s.sh_link];
+                std::vector<char> strs(st.sh_size);
+                std::vector<Elf64_Sym> syms(s.sh_size / sizeof(Elf64_Sym));
+                if (fseek(f, (long)st.sh_offset, SEEK_SET) || fread(strs.data(), 1, strs.size(), f) != strs.size()) break;
+                if (fseek(f, (long)s.sh_offset, SEEK_SET) || fread(syms.data(), sizeof(Elf64_Sym), syms.size(), f) != syms.size()) break;
+                for (auto& y : syms)
+                    if (y.st_value && y.st_name < strs.size() && !strcmp(&strs[y.st_name], sym)) { found = reinterpret_cast<void*>(L.base + y.st_value); break; }
+                break;
+            }
+        }
+    }
+    fclose(f);
+    return found;
+}
 static void unlimit_init() {
     g_unlimit = read_bool_prop("debug.knobs.unlimit");
     if (!g_unlimit) return;
+    static const char* kSym = "_ZN7android16FpsControlConfig15getGlobalConfigEv";
     void* h = dlopen("libgui.so", RTLD_NOW | RTLD_NOLOAD);
     if (!h) h = dlopen("libgui.so", RTLD_NOW);
-    if (h) g_fps_cfg_get = reinterpret_cast<void* (*)()>(dlsym(h, "_ZN7android16FpsControlConfig15getGlobalConfigEv"));
+    if (h) g_fps_cfg_get = reinterpret_cast<void* (*)()>(dlsym(h, kSym));
+    if (!g_fps_cfg_get) g_fps_cfg_get = reinterpret_cast<void* (*)()>(sym_from_loaded("libgui.so", kSym));
     if (!g_fps_cfg_get) g_unlimit_reason = "no_FpsControlConfig";
     __android_log_print(ANDROID_LOG_INFO, "refknobs", "unlimit=1: FpsControlConfig::getGlobalConfig %s", g_fps_cfg_get ? "找到" : "没有");
 }

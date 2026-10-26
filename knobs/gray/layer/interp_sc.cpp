@@ -36,6 +36,15 @@ long g_margin_ns = 3000000;    // debug.knobs.interp_sc_margin_ns: 比定的上�
 uint64_t g_pacer_late = 0;     // 轮到时已经过了定的时刻
 bool g_vote_fixed = false;     // debug.knobs.interp_sc_vote=fixed
 int32_t g_xform_used = 0;
+// debug.knobs.interp_sc_winvote=<fps>: 改写游戏窗口自己的帧率投票 (游戏常投 60)。SF 按 uid 的帧率覆盖只放行「该 uid 的 vsync」上的事务,
+// 游戏投 60 时同 uid 的子图层事务每隔一个 vsync 才被处理 (红魔原神插帧卡在约 89 帧)。<0 = 不动 (缺省)
+float g_winvote = -1.f;
+// debug.knobs.interp_sc_kick_ns=<ns>: 每隔这么久给子图层发一个只带可见性的小事务, 让 SF 每个 vsync 都醒来合成。
+// 红魔 (ZTE 改过的 SF) 不是每个 vsync 都醒: 带 desiredPresentTime 的缓冲等不到自己那个 vsync, 拖到下一次和下一张撞车被丢
+// (frametimeline: 子图层 26% Dropped, 中间缺显示帧, 卡在 89 帧)。0 = 不发 (缺省)
+long g_kick_ns = 0;
+uint64_t g_winvote_calls = 0;
+int32_t g_winvote_rc = 0;
 int32_t g_xform = -1;          // debug.knobs.interp_sc_xform: 强制子图层 setGeometry 的 transform (ANATIVEWINDOW_TRANSFORM_*); 缺省按 preTransform 自动
 
 bool requested() {
@@ -59,6 +68,12 @@ bool requested() {
         char xf[PROP_VALUE_MAX] = {0};
         __system_property_get("debug.knobs.interp_sc_xform", xf);
         if (xf[0]) g_xform = atoi(xf);
+        char wv[PROP_VALUE_MAX] = {0};
+        __system_property_get("debug.knobs.interp_sc_winvote", wv);
+        if (wv[0]) g_winvote = (float)atof(wv);
+        char kk[PROP_VALUE_MAX] = {0};
+        __system_property_get("debug.knobs.interp_sc_kick_ns", kk);
+        if (kk[0]) g_kick_ns = atol(kk);
     }
     return g_req == 1;
 }
@@ -83,12 +98,33 @@ struct Api {
     void (*setFrameRate)(ASurfaceTransaction*, ASurfaceControl*, float, int8_t) = nullptr;   // API 30
     void (*setFrameRateCS)(ASurfaceTransaction*, ASurfaceControl*, float, int8_t, int8_t) = nullptr;   // API 31
     void (*setTransparency)(ASurfaceTransaction*, ASurfaceControl*, int8_t) = nullptr;
+    int32_t (*winSetFrameRate)(ANativeWindow*, float, int8_t, int8_t) = nullptr;   // API 31, 可缺
     int32_t (*winW)(ANativeWindow*) = nullptr;
     int32_t (*winH)(ANativeWindow*) = nullptr;
     int (*ahbAlloc)(const AHardwareBuffer_Desc*, AHardwareBuffer**) = nullptr;
     void (*ahbRelease)(AHardwareBuffer*) = nullptr;
     bool ok = false;
 } g_api;
+std::mutex g_kick_m;
+ASurfaceControl* g_kick_sc = nullptr;
+bool g_kick_started = false;
+uint64_t g_kicks = 0;
+void kick_loop() {
+    timespec next; clock_gettime(CLOCK_MONOTONIC, &next);
+    for (;;) {
+        next.tv_nsec += g_kick_ns;
+        while (next.tv_nsec >= 1000000000L) { next.tv_nsec -= 1000000000L; next.tv_sec++; }
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, nullptr);
+        std::lock_guard<std::mutex> lk(g_kick_m);
+        if (!g_kick_sc) continue;
+        ASurfaceTransaction* t = g_api.txnCreate();
+        if (!t) continue;
+        g_api.setVisibility(t, g_kick_sc, 1);
+        g_api.txnApply(t);
+        g_api.txnDelete(t);
+        g_kicks++;
+    }
+}
 
 bool load_api() {
     if (g_api.ok) return true;
@@ -110,6 +146,7 @@ bool load_api() {
     SC_SYM(h, setZOrder, "ASurfaceTransaction_setZOrder")
     SC_SYM(h, reparent, "ASurfaceTransaction_reparent")
     SC_SYM(h, setFrameRate, "ASurfaceTransaction_setFrameRate")
+    g_api.winSetFrameRate = reinterpret_cast<decltype(g_api.winSetFrameRate)>(dlsym(nw, "ANativeWindow_setFrameRateWithChangeStrategy"));
     SC_SYM(nw, winW, "ANativeWindow_getWidth")
     SC_SYM(nw, winH, "ANativeWindow_getHeight")
     SC_SYM(nw, ahbAlloc, "AHardwareBuffer_allocate")
@@ -460,7 +497,16 @@ void sc_show(VkDevice dev, const std::vector<std::pair<ScBuf*, int64_t>>& frames
             // (真机: 超分 + 插帧时 HUD 出现双影、整屏发灰)
             if (g_api.setTransparency) g_api.setTransparency(t, D->sc, 2 /* ASURFACE_TRANSACTION_TRANSPARENCY_OPAQUE */);
             D->geometry_set = true;
+            if (g_kick_ns > 0) {
+                std::lock_guard<std::mutex> kl(g_kick_m);
+                g_kick_sc = D->sc;
+                if (!g_kick_started) { g_kick_started = true; std::thread(kick_loop).detach(); }
+            }
             SC_LOG("子图层几何: 源 %ux%u → 目标 %dx%d", w, h, dw, dh);
+        }
+        if (g_winvote >= 0.f && g_api.winSetFrameRate && g_window && (g_shown % 120) == 0) {   // 约每秒一次, 盖住游戏后来的重设
+            g_winvote_rc = g_api.winSetFrameRate(g_window, g_winvote, 1 /* FIXED_SOURCE */, 1 /* ALWAYS */);
+            g_winvote_calls++;
         }
         // 每个事务各拿一份 fence fd (setBuffer 接管所有权); 最后一个用原件
         int fd = fence_fd < 0 ? -1 : (i + 1 == frames.size() ? fence_fd : dup(fence_fd));
@@ -513,6 +559,7 @@ void sc_on_destroy_device(VkDevice dev) {
     if (it == g_devs.end()) return;
     Dev& D = it->second;
     pacer_flush();
+    { std::lock_guard<std::mutex> kl(g_kick_m); if (g_kick_sc == D.sc) g_kick_sc = nullptr; }
     if (D.sc) {
         if (g_api.txnCreate && g_api.reparent) {   // 从窗口上摘掉子图层
             ASurfaceTransaction* t = g_api.txnCreate();
@@ -532,8 +579,8 @@ void sc_on_destroy_device(VkDevice dev) {
 std::string sc_json() {
     std::lock_guard<std::mutex> lk(g_m);
     char b[400];
-    snprintf(b, sizeof b, "{\"requested\":%s,\"window\":%s,\"shown\":%llu,\"buffers_allocated\":%llu,\"pacer\":%d,\"margin_ns\":%ld,\"pacer_late\":%llu,\"vsync_cb\":%llu,\"vsync_sent\":%llu,\"xform\":%d,\"reason\":\"%s\"}",
+    snprintf(b, sizeof b, "{\"requested\":%s,\"window\":%s,\"shown\":%llu,\"buffers_allocated\":%llu,\"pacer\":%d,\"margin_ns\":%ld,\"pacer_late\":%llu,\"vsync_cb\":%llu,\"vsync_sent\":%llu,\"xform\":%d,\"winvote\":%.0f,\"winvote_calls\":%llu,\"winvote_rc\":%d,\"kick_ns\":%ld,\"kicks\":%llu,\"reason\":\"%s\"}",
              g_req == 1 ? "true" : "false", g_window ? "true" : "false", (unsigned long long)g_shown,
-             (unsigned long long)g_alloc, g_pacer, g_margin_ns, (unsigned long long)g_pacer_late, (unsigned long long)g_vsync_cb, (unsigned long long)g_vsync_sent, g_xform_used, g_reason.c_str());
+             (unsigned long long)g_alloc, g_pacer, g_margin_ns, (unsigned long long)g_pacer_late, (unsigned long long)g_vsync_cb, (unsigned long long)g_vsync_sent, g_xform_used, g_winvote, (unsigned long long)g_winvote_calls, g_winvote_rc, g_kick_ns, (unsigned long long)g_kicks, g_reason.c_str());
     return b;
 }

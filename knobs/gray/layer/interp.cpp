@@ -177,6 +177,7 @@ long g_lead_ns = -1;       // -1 = 一个刷新周期
 long g_sc_ring = 0;        // 子图层缓冲环张数; 0 = 4*(m+1)
 uint64_t g_sc_last = 0;    // 子图层上一张定的上屏时刻 (ns)
 uint64_t g_sc_skip = 0;    // 积压太多而不插合成帧的次数
+long g_sc_gap_ns = 0;      // debug.knobs.interp_sc_gap_ns: 相邻两张最小间隔, 0 = 一个周期 + 0.1 ms
 long g_extra_images = 2;
 long g_mult = 1;           // interp_mult: 每个真实帧之前插几张 (t = k/(mult+1)); >1 时不定显示时刻, 纯 FIFO
 long g_acquire_ms = 4;
@@ -457,6 +458,7 @@ bool ip_init_from_props() {
     std::string st = prop("debug.knobs.interp_stamp");
     g_stamp = st.empty() || st[0] == '1';
     g_lead_ns = prop_long("debug.knobs.interp_lead_ns", -1, -1, 200000000);
+    g_sc_gap_ns = prop_long("debug.knobs.interp_sc_gap_ns", 0, 0, 50000000);
     g_sc_ring = prop_long("debug.knobs.interp_sc_ring", 0, 0, 64);
     g_mult = prop_long("debug.knobs.interp_mult", 1, 1, kMaxMult);
     g_extra_images = prop_long("debug.knobs.interp_extra_images", g_mult + 1, 1, kMaxMult + 1);
@@ -761,7 +763,8 @@ VkResult ip_on_present(VkQueue q, const VkPresentInfoKHR* pi, PFN_vkQueuePresent
         // 相邻两张至少隔一个 vsync (按投的帧率算; 没投按 120): 游戏帧时抖动时按「半个周期」排会和上一帧落进同一个 vsync,
         // SF 只显示后一张 (真机: 120 Hz 下 30% 的间隔是 16.7 ms, 子图层只上屏 89/s)。
         // 往后挪积压超过一个游戏周期时, 这一帧不插合成帧, 只送真实帧 (延迟不往上滚)
-        const uint64_t gap = 1000000000ull / (uint64_t)(g_fps_vote > 0 ? g_fps_vote : 120) - 300000ull;
+        // debug.knobs.interp_sc_gap_ns 可覆盖。试过「一个周期 + 0.1 ms」: 红魔原神上屏不变 (89), 积压让延迟 33 → 45 ms, 所以缺省不变
+        const uint64_t gap = g_sc_gap_ns > 0 ? (uint64_t)g_sc_gap_ns : 1000000000ull / (uint64_t)(g_fps_vote > 0 ? g_fps_vote : 120) - 300000ull;
         auto slot = [&](uint64_t want) { uint64_t d = (g_sc_last && want < g_sc_last + gap) ? g_sc_last + gap : want; g_sc_last = d; return d; };
         std::vector<std::pair<ScBuf*, int64_t>> show;
         int shown_synth = 0;
