@@ -3,6 +3,8 @@ secrets.env
 
 # 编译产物
 /phonefarm
+/phonefarm.new
+/phonefarm.prev
 /ocr
 src/target/
 
