@@ -35,6 +35,8 @@ int g_pacer = 0;               // debug.knobs.interp_sc_pacer=1: 层自己的送
 long g_margin_ns = 3000000;    // debug.knobs.interp_sc_margin_ns: 比定的上屏时刻提前多久 apply
 uint64_t g_pacer_late = 0;     // 轮到时已经过了定的时刻
 bool g_vote_fixed = false;     // debug.knobs.interp_sc_vote=fixed
+int32_t g_xform_used = 0;
+int32_t g_xform = -1;          // debug.knobs.interp_sc_xform: 强制子图层 setGeometry 的 transform (ANATIVEWINDOW_TRANSFORM_*); 缺省按 preTransform 自动
 
 bool requested() {
     if (g_req < 0) {
@@ -54,6 +56,9 @@ bool requested() {
         char vt[PROP_VALUE_MAX] = {0};
         __system_property_get("debug.knobs.interp_sc_vote", vt);
         g_vote_fixed = !strcmp(vt, "fixed");
+        char xf[PROP_VALUE_MAX] = {0};
+        __system_property_get("debug.knobs.interp_sc_xform", xf);
+        if (xf[0]) g_xform = atoi(xf);
     }
     return g_req == 1;
 }
@@ -423,7 +428,7 @@ void pacer_flush() {
 }
 #endif
 
-void sc_show(VkDevice dev, const std::vector<std::pair<ScBuf*, int64_t>>& frames, uint32_t w, uint32_t h, int fence_fd) {
+void sc_show(VkDevice dev, const std::vector<std::pair<ScBuf*, int64_t>>& frames, uint32_t w, uint32_t h, uint32_t pre_transform, int fence_fd) {
 #ifdef SC_HAVE_ANDROID
     std::lock_guard<std::mutex> lk(g_m);
     Dev* D = dev_of(dev);
@@ -434,10 +439,18 @@ void sc_show(VkDevice dev, const std::vector<std::pair<ScBuf*, int64_t>>& frames
         if (!D->geometry_set) {
             // 子图层在父图层 (游戏 SurfaceView) 的坐标里: 父图层自带「缓冲 → 屏幕」的缩放, 子图层跟着它缩放,
             // 所以目标大小 = 缓冲大小 (真机: 按窗口 2688x1216 设会被再放大 1.26 倍)
-            int32_t dw = g_dst_w ? g_dst_w : (int32_t)w;
-            int32_t dh = g_dst_h ? g_dst_h : (int32_t)h;
+            // 游戏按 preTransform 预旋转时 (例 refbench: ROTATE_90), 父图层的缓冲带着反向的缓冲变换 (驱动设的),
+            // 子图层不继承它: 这里设同样的反向变换, 目标宽高对调 (荣耀 AAP-AN00 实测, 不设时画面错位)
+            int32_t xf = pre_transform == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR ? 7 /* ROTATE_270 */
+                       : pre_transform == VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR ? 3 /* ROTATE_180 */
+                       : pre_transform == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR ? 4 /* ROTATE_90 */ : 0;
+            if (g_xform >= 0) xf = g_xform;
+            bool swap = xf == 4 || xf == 7;
+            int32_t dw = g_dst_w ? g_dst_w : (int32_t)(swap ? h : w);
+            int32_t dh = g_dst_h ? g_dst_h : (int32_t)(swap ? w : h);
             ARectI src{0, 0, (int32_t)w, (int32_t)h}, dst{0, 0, dw, dh};
-            g_api.setGeometry(t, D->sc, &src, &dst, 0);
+            g_api.setGeometry(t, D->sc, &src, &dst, xf);
+            g_xform_used = xf;
             g_api.setVisibility(t, D->sc, 1);
             if (g_api.setZOrder) g_api.setZOrder(t, D->sc, 1);
             // 投票: 缺省 DEFAULT; debug.knobs.interp_sc_vote=fixed 时按「固定帧率内容」投 (FIXED_SOURCE, 切换策略 ALWAYS)
@@ -519,8 +532,8 @@ void sc_on_destroy_device(VkDevice dev) {
 std::string sc_json() {
     std::lock_guard<std::mutex> lk(g_m);
     char b[400];
-    snprintf(b, sizeof b, "{\"requested\":%s,\"window\":%s,\"shown\":%llu,\"buffers_allocated\":%llu,\"pacer\":%d,\"margin_ns\":%ld,\"pacer_late\":%llu,\"vsync_cb\":%llu,\"vsync_sent\":%llu,\"reason\":\"%s\"}",
+    snprintf(b, sizeof b, "{\"requested\":%s,\"window\":%s,\"shown\":%llu,\"buffers_allocated\":%llu,\"pacer\":%d,\"margin_ns\":%ld,\"pacer_late\":%llu,\"vsync_cb\":%llu,\"vsync_sent\":%llu,\"xform\":%d,\"reason\":\"%s\"}",
              g_req == 1 ? "true" : "false", g_window ? "true" : "false", (unsigned long long)g_shown,
-             (unsigned long long)g_alloc, g_pacer, g_margin_ns, (unsigned long long)g_pacer_late, (unsigned long long)g_vsync_cb, (unsigned long long)g_vsync_sent, g_reason.c_str());
+             (unsigned long long)g_alloc, g_pacer, g_margin_ns, (unsigned long long)g_pacer_late, (unsigned long long)g_vsync_cb, (unsigned long long)g_vsync_sent, g_xform_used, g_reason.c_str());
     return b;
 }

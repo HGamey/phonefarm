@@ -42,6 +42,6 @@ void sc_acquire_barrier(VkCommandBuffer cb, PFN_vkCmdPipelineBarrier bar, VkImag
 // 层的命令提交之后: 导出一个 sync fd (这之前同队列的工作做完才 signal); 拿不到返回 -1 (调用方改为 CPU 等)
 int sc_export_fence(VkDevice dev, VkQueue q);
 // 依次把缓冲交给子图层, desired = CLOCK_MONOTONIC ns (0 = 尽快); fence_fd 由本函数接管 (-1 = 已写完)
-void sc_show(VkDevice dev, const std::vector<std::pair<ScBuf*, int64_t>>& frames, uint32_t w, uint32_t h, int fence_fd);
+void sc_show(VkDevice dev, const std::vector<std::pair<ScBuf*, int64_t>>& frames, uint32_t w, uint32_t h, uint32_t pre_transform, int fence_fd);
 void sc_on_destroy_device(VkDevice dev);
 std::string sc_json();

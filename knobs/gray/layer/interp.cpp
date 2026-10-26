@@ -99,6 +99,7 @@ const uint32_t kOwnIdBase = 0x40000000u;
 
 struct Swap {
     uint32_t w = 0, h = 0, fmt = 0, usage = 0, n_images = 0;
+    uint32_t pre = 0;   // preTransform: 游戏按它预旋转画面, 子图层要反着转回来
     uint32_t min_req = 0, min_used = 0, present_mode_orig = 0, present_mode_used = 0;
     bool patched = false;
     std::vector<VkImage> imgs;
@@ -594,7 +595,7 @@ void ip_on_swapchain(VkDevice dev, VkSwapchainKHR sc, const VkSwapchainCreateInf
     auto old = D->swaps.find(sc);
     if (old != D->swaps.end()) { release_swap_locked(D, old->second); D->swaps.erase(old); }
     Swap S;
-    S.w = ci->imageExtent.width; S.h = ci->imageExtent.height; S.fmt = (uint32_t)ci->imageFormat; S.usage = (uint32_t)ci->imageUsage;
+    S.w = ci->imageExtent.width; S.h = ci->imageExtent.height; S.fmt = (uint32_t)ci->imageFormat; S.usage = (uint32_t)ci->imageUsage; S.pre = (uint32_t)ci->preTransform;
     S.min_used = ci->minImageCount; S.present_mode_used = (uint32_t)ci->presentMode;
     S.min_req = patched ? D->pend_min_req : ci->minImageCount;
     S.present_mode_orig = patched ? D->pend_mode_orig : (uint32_t)ci->presentMode;
@@ -774,7 +775,7 @@ VkResult ip_on_present(VkQueue q, const VkPresentInfoKHR* pi, PFN_vkQueuePresent
         g_cpu_us.push((now_ns() - t) / 1000);
         VkSemaphore semN = S.sems[idxN];
         lk.unlock();
-        sc_show(D->dev, show, S.w, S.h, fence_fd);
+        sc_show(D->dev, show, S.w, S.h, S.pre, fence_fd);
         VkPresentInfoKHR pn = *pi;
         pn.waitSemaphoreCount = 1; pn.pWaitSemaphores = &semN;
         return next(q, &pn);
