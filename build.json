@@ -1,0 +1,23 @@
+{
+  "sha": "00b4149020017e7feb196d4e0a886c8f78d43ada",
+  "built_at": "2026-10-26T23:28:47Z",
+  "run_url": "https://github.com/HGamey/phonefarm/actions/runs/40419562924",
+  "ndk": "28.2.13676358",
+  "files": {
+    "VkLayer_refknobs.json": {
+      "sha256": "ec69a8c831a6ac4bd6521904269b5dc9809def25df36c9152b7403e1ac46776d",
+      "size": 449,
+      "asset": "00b4149020017e7feb196d4e0a886c8f78d43ada-VkLayer_refknobs.json"
+    },
+    "libVkLayer_refknobs.so": {
+      "sha256": "7c20eec8403509714ed27a02182da54aedfe308dde2fc9fc34e7bf5dee59f9cd",
+      "size": 4070824,
+      "asset": "00b4149020017e7feb196d4e0a886c8f78d43ada-libVkLayer_refknobs.so"
+    },
+    "phonefarm": {
+      "sha256": "dd05b8dd6a586fa831e91594cc535942eb95b287e0eb395c1e2d4dc0b58c7896",
+      "size": 12823520,
+      "asset": "00b4149020017e7feb196d4e0a886c8f78d43ada-phonefarm"
+    }
+  }
+}
