@@ -44,4 +44,6 @@ int sc_export_fence(VkDevice dev, VkQueue q);
 // 依次把缓冲交给子图层, desired = CLOCK_MONOTONIC ns (0 = 尽快); fence_fd 由本函数接管 (-1 = 已写完)
 void sc_show(VkDevice dev, const std::vector<std::pair<ScBuf*, int64_t>>& frames, uint32_t w, uint32_t h, uint32_t pre_transform, int fence_fd);
 void sc_on_destroy_device(VkDevice dev);
+// debug.knobs.interp_sc_grid=1 且已估出 vsync 网格时: phase = 最近一次 vsync (CLOCK_MONOTONIC ns), period = 周期; 否则 false
+bool sc_vsync_grid(uint64_t* phase, uint64_t* period);
 std::string sc_json();

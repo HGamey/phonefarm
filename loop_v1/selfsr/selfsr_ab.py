@@ -39,7 +39,7 @@ UNLIMIT_PROP = "debug.knobs.unlimit"
 # 截图 (2688x1216) 右上角那排固定图标: 整屏锐度被场景主导 (冷启动后角色/镜头可能不同), 这块内容各臂相同
 HUD_BOX = (1760, 10, 2600, 130)
 IP_PROPS = ("debug.knobs.interp", "debug.knobs.interp_mode", "debug.knobs.interp_fps")
-IP_TUNE = ("sc_kick_ns", "sc_gap_ns", "sc_winvote", "sc_xform", "sc_vote", "sc_pacer", "sc_margin_ns", "sc_ring", "pacing", "stamp", "acquire_ms", "extra_images", "lead_ns", "mult", "backend", "sc_dst", "panel", "framepacing",
+IP_TUNE = ("sfovr", "sfwait", "sc_grid", "sc_real_wait", "sc_kick_ns", "sc_gap_ns", "sc_winvote", "sc_xform", "sc_vote", "sc_pacer", "sc_margin_ns", "sc_ring", "pacing", "stamp", "acquire_ms", "extra_images", "lead_ns", "mult", "backend", "sc_dst", "panel", "framepacing",
            "unlimit")
 FP_PROP = "vendor.perf.framepacing.enable"   # 高通 perf HAL 的游戏帧节奏; framepacing=<值> 进世界后设, 收尾写回原值   # panel 不是层属性, 见 prepare   # ip 臂第 4 段可设的 debug.knobs.interp_<键>
 
@@ -320,7 +320,31 @@ PANEL_MODE = {"60": 1, "90": 2, "120": 3, "144": 4}
 PANEL_ORIG = {"path": None}   # <输出目录>/panel_orig.json: 开跑前的原值 (run 写, prepare/restore 读)
 
 
+# sfovr=<Hz>: 进世界后用 SF 后门 (事务 1039) 给游戏 uid 下帧率覆盖, 优先于按图层投票算出的覆盖;
+# 红魔上游戏主图层投 60 时, SF 的 isVsyncValid 按 60 放行同 uid 的子图层事务。传 0 删除覆盖。
+SFOVR_UID = {"uid": None}
+# sfwait=off: 进世界后关红魔 SF 的 waitframe (dumpsys SurfaceFlinger --fpsControl_waitframe_off)。它在 commit 里每 1 ms
+# 轮询一次游戏图层缓冲的 fence, 一等 7~8 ms, 下一个 vsync 因 backpressure 整帧跳过, 子图层缓冲两张撞车被顶掉
+SFWAIT_OFF = {"on": False}
+
+
+def set_sfovr(dev, uid, hz):
+    dev.su(f"service call SurfaceFlinger 1039 i32 {int(uid)} f {float(hz)}")
+
+
+# debug.* 属性用 shell 身份写: 荣耀的 su (u:r:kernel) 被 init 拒写 debug.*, shell 域在所有机器上都能写。
 def restore_panel(dev):
+    # 收尾可能在另一个进程 (_locked), 不知道下过哪个 uid: 按 SF 里现有的 Backdoor 条目逐个删
+    dump = dev.su("dumpsys SurfaceFlinger | grep -A8 '^FrameRateOverrides'")
+    back = dump.split("Backdoor=", 1)[1] if "Backdoor=" in dump else ""
+    for uid in re.findall(r"\{(\d+), [0-9.]+ Hz\}", back.split("\n\n", 1)[0]):
+        set_sfovr(dev, uid, 0)
+    SFOVR_UID["uid"] = None
+    # sfwait=off 关掉的 ZTE waitframe 写回开 (红魔出厂是开的: atrace 里 commit 每 1 ms 轮询游戏缓冲的 fence)
+    # 收尾可能在另一个进程, 不知道关没关过: ZTE 机器上一律写回开 (别的机器没有这个开关, 不发)
+    if SFWAIT_OFF["on"] or dev.prop("ro.vendor.feature.zte_feature_ifas") == "true":
+        dev.su("dumpsys SurfaceFlinger --fpsControl_waitframe_on >/dev/null")
+        SFWAIT_OFF["on"] = False
     try:
         orig = json.load(open(PANEL_ORIG["path"]))
     except (OSError, ValueError, TypeError):
@@ -357,21 +381,21 @@ def prepare(a, k, orig_mode):
     dev = Dev(a.serial)
     dev.shell(f"am force-stop {a.pkg}")
     gm = game_mode(dev, a.pkg, k["downscale"], orig_mode)
-    dev.su(f"setprop {SR_PROP} {shlex.quote(k['selfsr'] or '')}")
+    dev.shell(f"setprop {SR_PROP} {shlex.quote(k['selfsr'] or '')}")
     # 厂商 G-FRC+: 只改 settings global game_gfrc_mode 里本包那一项; 收尾写回开跑前原值 (orig.json)
     cur = dev.shell("settings get global game_gfrc_mode").strip()
     if cur not in ("", "null"):
         # 先一律关; G-FRC+ 要在进世界之后再开才生效 (见 arm_plain)
         dev.shell(f"settings put global game_gfrc_mode {shlex.quote(set_pkg_bits(cur, a.pkg, '000'))}")
     so = k.get("sr_opts") or {}
-    dev.su("; ".join(f"setprop debug.knobs.selfsr_{o} {shlex.quote(so.get(o, ''))}" for o in SR_OPTS if o != "unlimit"))
+    dev.shell("; ".join(f"setprop debug.knobs.selfsr_{o} {shlex.quote(so.get(o, ''))}" for o in SR_OPTS if o != "unlimit"))
     unl = k.get("unlimit") or so.get("unlimit") == "1" or (k.get("tune") or {}).get("unlimit") == "1"
-    dev.su(f"setprop {UNLIMIT_PROP} {'1' if unl else shlex.quote('')}")
+    dev.shell(f"setprop {UNLIMIT_PROP} {'1' if unl else shlex.quote('')}")
     mode = k.get("interp")
-    dev.su(f"setprop {IP_PROPS[0]} {'1' if mode else shlex.quote('')}; setprop {IP_PROPS[1]} {shlex.quote(mode or '')}; "
+    dev.shell(f"setprop {IP_PROPS[0]} {'1' if mode else shlex.quote('')}; setprop {IP_PROPS[1]} {shlex.quote(mode or '')}; "
            f"setprop {IP_PROPS[2]} {shlex.quote(k.get('fps') or '')}")
     tune = k.get("tune") or {}
-    dev.su("; ".join(f"setprop debug.knobs.interp_{t} {shlex.quote(str(tune.get(t, '')))}" for t in IP_TUNE if t not in ("panel", "framepacing", "unlimit")))
+    dev.shell("; ".join(f"setprop debug.knobs.interp_{t} {shlex.quote(str(tune.get(t, '')))}" for t in IP_TUNE if t not in ("panel", "framepacing", "unlimit", "sfovr", "sfwait")))
     # panel=<Hz>: 屏幕刷新率 (红魔 refresh_rate_mode), 收尾 (restore) 按开跑前记下的原值写回
     # 刷新率在进世界之后才设 (arm_layer): 原神启动时游戏助手会把它压回 60 Hz
     restore_panel(dev)
@@ -449,6 +473,18 @@ def arm_layer(a, out, name, k, note, locked):
         if fpv is not None:   # 进世界后设高通帧节奏开关, 回读核对
             dev.su(f"setprop {FP_PROP} {shlex.quote(str(fpv))}")
             rec["framepacing_now"] = dev.prop(FP_PROP)
+        ovr = (k.get("tune") or {}).get("sfovr")
+        if ovr:
+            m = re.search(r"uid:(\d+)", dev.shell(f"pm list packages -U {a.pkg}"))
+            if not m:
+                rec["error"] = "sfovr: 读不到游戏 uid"
+                return rec
+            SFOVR_UID["uid"] = int(m.group(1))
+            set_sfovr(dev, SFOVR_UID["uid"], ovr)
+            rec["sfovr"] = dev.su("dumpsys SurfaceFlinger | grep -A6 '^FrameRateOverrides'").strip()
+        if (k.get("tune") or {}).get("sfwait") == "off":
+            SFWAIT_OFF["on"] = True
+            rec["sfwait"] = dev.su("dumpsys SurfaceFlinger --fpsControl_waitframe_off").strip()[-200:]
         time.sleep(a.settle)
         code, s = pf_json(a.phonefarm, "gray-layer", "session-status", "--out", sdir, "--json")
         if proc.poll() is not None or s.get("phase") != "ready":
@@ -555,17 +591,17 @@ def main():
             dev = Dev(a.serial)
             dev.shell(f"am force-stop {a.pkg}")
             gm = game_mode(dev, a.pkg, None, a.orig_mode)
-            dev.su(f"setprop {SR_PROP} ''")
-            dev.su("; ".join(f"setprop debug.knobs.selfsr_{o} ''" for o in SR_OPTS if o != "unlimit"))
-            dev.su(f"setprop {UNLIMIT_PROP} ''")
+            dev.shell(f"setprop {SR_PROP} ''")
+            dev.shell("; ".join(f"setprop debug.knobs.selfsr_{o} ''" for o in SR_OPTS if o != "unlimit"))
+            dev.shell(f"setprop {UNLIMIT_PROP} ''")
             try:
                 og = json.load(open(os.path.join(out, "orig.json"))).get("game_gfrc_mode")
             except (OSError, ValueError):
                 og = None
             if og not in (None, "", "null"):
                 dev.shell(f"settings put global game_gfrc_mode {shlex.quote(og)}")
-            dev.su("; ".join(f"setprop {p} ''" for p in IP_PROPS))
-            dev.su("; ".join(f"setprop debug.knobs.interp_{t} ''" for t in IP_TUNE if t not in ("panel", "framepacing", "unlimit")))
+            dev.shell("; ".join(f"setprop {p} ''" for p in IP_PROPS))
+            dev.shell("; ".join(f"setprop debug.knobs.interp_{t} ''" for t in IP_TUNE if t not in ("panel", "framepacing", "unlimit", "sfovr", "sfwait")))
             restore_panel(dev)
             rec = {"game_mode": gm, "mode_now": current_mode(dev, a.pkg), "selfsr_prop": dev.prop(SR_PROP),
                    "game_gfrc_mode": dev.shell("settings get global game_gfrc_mode").strip(),

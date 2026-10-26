@@ -89,9 +89,11 @@ def layer_src(sf_dump, pkg):
         if "SurfaceView[" in l and "(BLAST)" in l and pkg[:12] in l:
             for nxt in lines[i + 1:i + 3]:
                 cells = [c.strip() for c in nxt.split("|")]
-                if len(cells) >= 7:
-                    nums = [float(x) for x in cells[6].split()]
-                    if len(nums) == 4:
+                # Source Crop: 4 个带小数点的数 (荣耀的表多一列 [*], 不能按固定列号取)
+                for c in cells[5:]:
+                    toks = c.split()
+                    if len(toks) == 4 and all(re.fullmatch(r"-?\d+\.\d+", t) for t in toks):
+                        nums = [float(t) for t in toks]
                         w, h = nums[2] - nums[0], nums[3] - nums[1]
                         return [int(max(w, h)), int(min(w, h))]
     return None

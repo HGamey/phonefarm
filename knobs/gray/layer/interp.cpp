@@ -177,6 +177,7 @@ long g_lead_ns = -1;       // -1 = 一个刷新周期
 long g_sc_ring = 0;        // 子图层缓冲环张数; 0 = 4*(m+1)
 uint64_t g_sc_last = 0;    // 子图层上一张定的上屏时刻 (ns)
 uint64_t g_sc_skip = 0;    // 积压太多而不插合成帧的次数
+long g_sc_real_wait = 0;  // debug.knobs.interp_sc_real_wait=1: 游戏的真实帧交给它自己的 swapchain 之前, CPU 等 GPU 做完 (见 sc 送显处)
 long g_sc_gap_ns = 0;      // debug.knobs.interp_sc_gap_ns: 相邻两张最小间隔, 0 = 一个周期 + 0.1 ms
 long g_extra_images = 2;
 long g_mult = 1;           // interp_mult: 每个真实帧之前插几张 (t = k/(mult+1)); >1 时不定显示时刻, 纯 FIFO
@@ -459,6 +460,7 @@ bool ip_init_from_props() {
     g_stamp = st.empty() || st[0] == '1';
     g_lead_ns = prop_long("debug.knobs.interp_lead_ns", -1, -1, 200000000);
     g_sc_gap_ns = prop_long("debug.knobs.interp_sc_gap_ns", 0, 0, 50000000);
+    g_sc_real_wait = prop_long("debug.knobs.interp_sc_real_wait", 0, 0, 1);
     g_sc_ring = prop_long("debug.knobs.interp_sc_ring", 0, 0, 64);
     g_mult = prop_long("debug.knobs.interp_mult", 1, 1, kMaxMult);
     g_extra_images = prop_long("debug.knobs.interp_extra_images", g_mult + 1, 1, kMaxMult + 1);
@@ -764,8 +766,21 @@ VkResult ip_on_present(VkQueue q, const VkPresentInfoKHR* pi, PFN_vkQueuePresent
         // SF 只显示后一张 (真机: 120 Hz 下 30% 的间隔是 16.7 ms, 子图层只上屏 89/s)。
         // 往后挪积压超过一个游戏周期时, 这一帧不插合成帧, 只送真实帧 (延迟不往上滚)
         // debug.knobs.interp_sc_gap_ns 可覆盖。试过「一个周期 + 0.1 ms」: 红魔原神上屏不变 (89), 积压让延迟 33 → 45 ms, 所以缺省不变
-        const uint64_t gap = g_sc_gap_ns > 0 ? (uint64_t)g_sc_gap_ns : 1000000000ull / (uint64_t)(g_fps_vote > 0 ? g_fps_vote : 120) - 300000ull;
-        auto slot = [&](uint64_t want) { uint64_t d = (g_sc_last && want < g_sc_last + gap) ? g_sc_last + gap : want; g_sc_last = d; return d; };
+        uint64_t gph = 0, gP = 0;
+        const bool grid = sc_vsync_grid(&gph, &gP);   // interp_sc_grid=1: 对齐 vsync 网格, 每张取格子中点、各占一格
+        // 对齐时先只推到「上一张 + 半格」再向上取中点 = 紧挨着的下一格; 推一整格的话, 周期估计每帧略变,
+        // 「上一张 + P」常比下一个中点多一点, 被取到再下一格 (真机: 每次多跳一格, 积压到延迟 48 ms、上屏 75)
+        const uint64_t gap = grid ? gP / 2 : g_sc_gap_ns > 0 ? (uint64_t)g_sc_gap_ns : 1000000000ull / (uint64_t)(g_fps_vote > 0 ? g_fps_vote : 120) - 300000ull;
+        auto slot = [&](uint64_t want) {
+            uint64_t d = (g_sc_last && want < g_sc_last + gap) ? g_sc_last + gap : want;
+            if (grid) {   // 不早于 d 的第一个格子中点 (gph + kP + P/2)
+                const int64_t rel = (int64_t)d - (int64_t)(gph + gP / 2);
+                const int64_t k = rel <= 0 ? -((-rel) / (int64_t)gP) : (rel + (int64_t)gP - 1) / (int64_t)gP;
+                d = (uint64_t)((int64_t)(gph + gP / 2) + k * (int64_t)gP);
+                if (g_sc_last && d < g_sc_last + gP / 2) d += gP;
+            }
+            g_sc_last = d; return d;
+        };
         std::vector<std::pair<ScBuf*, int64_t>> show;
         int shown_synth = 0;
         uint64_t real_at = 0;
@@ -775,6 +790,14 @@ VkResult ip_on_present(VkQueue q, const VkPresentInfoKHR* pi, PFN_vkQueuePresent
         if (done) { real_at = slot(t0 + (uint64_t)shown_synth * step); show.push_back({rb, (int64_t)real_at}); }
         g_real++; g_synth += shown_synth;
         if (done) g_sc_delay.push(real_at - t);
+        // 红魔 SF (ZTE wait_frame) 在 commit 里每 1 ms 轮询一次「游戏图层缓冲的 fence 还没 signal」, 一等 7~8 ms,
+        // 这一帧合成晚了, 下一个 vsync 因 backpressure (PrevFramePending) 整帧跳过, 那一格排的子图层缓冲
+        // 下次和后一张一起就绪被顶掉 (atrace: commit → wait×8 → onCommitNotComposited, 子图层卡在 89 帧)。
+        // 游戏图层被不透明子图层盖着, 它的缓冲晚一点交没关系: 等 GPU 做完再交, SF 拿到时 fence 已 signal
+        if (g_sc_real_wait && sl.busy) {
+            if (D->WaitForFences(D->dev, 1, &sl.fence, VK_TRUE, 50000000ull) == VK_SUCCESS) g_fb["sc_real_waited"]++;
+            else g_fb["sc_real_wait_timeout"]++;
+        }
         g_cpu_us.push((now_ns() - t) / 1000);
         VkSemaphore semN = S.sems[idxN];
         lk.unlock();

@@ -8,6 +8,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <map>
@@ -43,6 +44,11 @@ float g_winvote = -1.f;
 // 红魔 (ZTE 改过的 SF) 不是每个 vsync 都醒: 带 desiredPresentTime 的缓冲等不到自己那个 vsync, 拖到下一次和下一张撞车被丢
 // (frametimeline: 子图层 26% Dropped, 中间缺显示帧, 卡在 89 帧)。0 = 不发 (缺省)
 long g_kick_ns = 0;
+// debug.knobs.interp_sc_grid=1: 定的上屏时刻对齐 vsync 网格, 每张取一个格子的中点、各占一格。
+// 红魔原神 (游戏 58 帧) 按「现在 + 提前量」排时刻不对齐 vsync: 相邻两张隔 9.2 ms 会跨过一整格 (那个 vsync 队列里没东西),
+// 隔 8.0 ms 会落进同一格 (前一张被顶掉); SF trace 里约 1/4 的 commit 队列为空, 子图层卡在 89 帧。0 = 不对齐 (缺省)
+int g_grid = 0;
+std::atomic<uint64_t> g_gv_last{0}, g_gv_period{0}, g_gv_cb{0};
 uint64_t g_winvote_calls = 0;
 int32_t g_winvote_rc = 0;
 int32_t g_xform = -1;          // debug.knobs.interp_sc_xform: 强制子图层 setGeometry 的 transform (ANATIVEWINDOW_TRANSFORM_*); 缺省按 preTransform 自动
@@ -74,6 +80,9 @@ bool requested() {
         char kk[PROP_VALUE_MAX] = {0};
         __system_property_get("debug.knobs.interp_sc_kick_ns", kk);
         if (kk[0]) g_kick_ns = atol(kk);
+        char gd[PROP_VALUE_MAX] = {0};
+        __system_property_get("debug.knobs.interp_sc_grid", gd);
+        g_grid = gd[0] == '1' ? 1 : 0;
     }
     return g_req == 1;
 }
@@ -456,6 +465,32 @@ void pacer_push(const PacerJob& j) {
     g_pcv.notify_all();
 }
 
+// vsync 网格: 自己的 looper 线程挂 AChoreographer 帧回调, 只记最近一次 vsync 的时刻和估出的周期
+// (回调可能隔几个 vsync 才来一次: 间隔按当前周期取整再除, 屏幕标称 120 Hz 实测 120.19 Hz, 不能用标称值外推)
+bool g_gv_started = false;
+ChoreoApi g_gch;
+void grid_cb(int64_t frame_ns, void*) {
+    uint64_t t = (uint64_t)frame_ns, last = g_gv_last.load(), P = g_gv_period.load();
+    if (!P) P = 8333333;
+    if (last && t > last) {
+        uint64_t n = (t - last + P / 2) / P;
+        if (n >= 1 && n <= 8) {
+            uint64_t p = (t - last) / n;
+            if (p > P * 97 / 100 && p < P * 103 / 100) g_gv_period.store(g_gv_period.load() ? (g_gv_period.load() * 15 + p) / 16 : p);
+        }
+    }
+    g_gv_last.store(t);
+    g_gv_cb++;
+    g_gch.post64(g_gch.instance(), grid_cb, nullptr);
+}
+void grid_loop() {
+    g_gch.prepare(0);
+    AChoreographer* c = g_gch.instance();
+    if (!c) { SC_LOG("vsync 网格: AChoreographer 拿不到, 不对齐"); return; }
+    g_gch.post64(c, grid_cb, nullptr);
+    for (;;) g_gch.pollOnce(-1, nullptr, nullptr, nullptr);
+}
+
 // 设备销毁前: 丢掉没送的, 等正在送的那张送完
 void pacer_flush() {
     std::unique_lock<std::mutex> lk(g_pm);
@@ -576,11 +611,36 @@ void sc_on_destroy_device(VkDevice dev) {
 #endif
 }
 
+bool sc_vsync_grid(uint64_t* phase, uint64_t* period) {
+#ifdef SC_HAVE_ANDROID
+    if (!requested() || !g_grid) return false;
+    {
+        std::lock_guard<std::mutex> lk(g_pm);
+        if (!g_gv_started) {
+            g_gv_started = true;
+            void* h = dlopen("libandroid.so", RTLD_NOW);
+            g_gch.prepare = reinterpret_cast<decltype(g_gch.prepare)>(dlsym(h, "ALooper_prepare"));
+            g_gch.pollOnce = reinterpret_cast<decltype(g_gch.pollOnce)>(dlsym(h, "ALooper_pollOnce"));
+            g_gch.instance = reinterpret_cast<decltype(g_gch.instance)>(dlsym(h, "AChoreographer_getInstance"));
+            g_gch.post64 = reinterpret_cast<decltype(g_gch.post64)>(dlsym(h, "AChoreographer_postFrameCallback64"));
+            if (g_gch.prepare && g_gch.pollOnce && g_gch.instance && g_gch.post64) std::thread(grid_loop).detach();
+        }
+    }
+    uint64_t last = g_gv_last.load(), P = g_gv_period.load();
+    if (!last || !P || g_gv_cb.load() < 8) return false;
+    *phase = last; *period = P;
+    return true;
+#else
+    (void)phase; (void)period;
+    return false;
+#endif
+}
+
 std::string sc_json() {
     std::lock_guard<std::mutex> lk(g_m);
-    char b[400];
-    snprintf(b, sizeof b, "{\"requested\":%s,\"window\":%s,\"shown\":%llu,\"buffers_allocated\":%llu,\"pacer\":%d,\"margin_ns\":%ld,\"pacer_late\":%llu,\"vsync_cb\":%llu,\"vsync_sent\":%llu,\"xform\":%d,\"winvote\":%.0f,\"winvote_calls\":%llu,\"winvote_rc\":%d,\"kick_ns\":%ld,\"kicks\":%llu,\"reason\":\"%s\"}",
+    char b[512];
+    snprintf(b, sizeof b, "{\"requested\":%s,\"window\":%s,\"shown\":%llu,\"buffers_allocated\":%llu,\"pacer\":%d,\"margin_ns\":%ld,\"pacer_late\":%llu,\"vsync_cb\":%llu,\"vsync_sent\":%llu,\"xform\":%d,\"winvote\":%.0f,\"winvote_calls\":%llu,\"winvote_rc\":%d,\"kick_ns\":%ld,\"kicks\":%llu,\"grid\":%d,\"grid_cb\":%llu,\"grid_period_ns\":%llu,\"reason\":\"%s\"}",
              g_req == 1 ? "true" : "false", g_window ? "true" : "false", (unsigned long long)g_shown,
-             (unsigned long long)g_alloc, g_pacer, g_margin_ns, (unsigned long long)g_pacer_late, (unsigned long long)g_vsync_cb, (unsigned long long)g_vsync_sent, g_xform_used, g_winvote, (unsigned long long)g_winvote_calls, g_winvote_rc, g_kick_ns, (unsigned long long)g_kicks, g_reason.c_str());
+             (unsigned long long)g_alloc, g_pacer, g_margin_ns, (unsigned long long)g_pacer_late, (unsigned long long)g_vsync_cb, (unsigned long long)g_vsync_sent, g_xform_used, g_winvote, (unsigned long long)g_winvote_calls, g_winvote_rc, g_kick_ns, (unsigned long long)g_kicks, g_grid, (unsigned long long)g_gv_cb.load(), (unsigned long long)g_gv_period.load(), g_reason.c_str());
     return b;
 }
