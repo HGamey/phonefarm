@@ -11,7 +11,8 @@
 #   7. native  vs srip:1:$SR_FULL:$IP_MODE:...       超分 + 插帧同时开 (第 5 步)
 #   8. layer+gfrc:101 vs ip:...+gfrc:101             插帧走子图层 (G-FRC+ 101 放开限帧到 60, 子图层插到 ~90), 第 4 步, 只在有 G-FRC+ 的机器上跑
 #   9. gfrc:111 vs srip:1:$SR_FULL:...+gfrc:101       自研超分 + 插帧 vs G-FRC+ 超分 + 插帧, 第 5 步, 同上
-# 环境变量: ENTER_SCRIPT (onboard 认不出时的进门脚本) KEEP_LAYER_PROP (1 = 全程保留层属性)
+#  10. ip:real vs ip:$IP_MODE (同一套参数)            插帧合成本身的代价: 两臂都 120 Hz、都走子图层, 对照臂只送真实帧不合成 (拆功耗用)
+# 环境变量: POWER (1 = 窗口内停充采整机功耗, 高通机) WINDOW (测量窗口秒数, 缺省 10; 量功耗建议 30) ENTER_SCRIPT (onboard 认不出时的进门脚本) KEEP_LAYER_PROP (1 = 全程保留层属性)
 #           SR_SHARP (满分辨率超分锐化, 缺省 1.0; Megacity 0) SR_FULL (本机屏幕:SR_SHARP) SR_SCALE (0.56) SR_OUT (2141x969:0.8) IP_MODE (bm) IP_FPS (120) GFRC_BUF (G-FRC+ 放大后的缓冲, 缺省 3214x1456)
 #           IP_TUNE (stamp=0,panel=120,backend=sc,lead_ns=25000000; 带 waitframe 的系统另加 ,unlimit=1,sfwait=off) COOL_MAX (42) SETS ("1 2 3 4 5 6 7 8 9")
 # 前提: 手机已 root、游戏已装好并登录过 (onboard 能进大世界)。层用 knobs/gray/build/build_layer.sh 现编。
@@ -58,6 +59,7 @@ HAS_GFRC=$(adb -s "$SERIAL" shell getprop ro.vendor.feature.zte_feature_gfrc | t
 run() {  # run <组名> <A> <B>
   PHONEFARM_BIN="$BIN" python3 -I "$ROOT/loop_v1/selfsr/selfsr_ab.py" run --serial "$SERIAL" --pkg "$PKG" \
     --out "$OUT/$1" --a "$2" --b "$3" --rounds "$ROUNDS" --so "$SO" --phonefarm "$BIN" --fan --cool-max "$COOL_MAX" \
+    --window "${WINDOW:-10}" ${POWER:+--power} \
     ${ENTER_SCRIPT:+--enter-script "$ENTER_SCRIPT"} ${KEEP_LAYER_PROP:+--keep-layer-prop}
 }
 for g in $SETS; do
@@ -70,6 +72,7 @@ for g in $SETS; do
     6) if [ "$HAS_GFRC" = true ]; then run 6_gfrc_vs_sr gfrc:101 "sr:1:$SR_FULL+gfrc:101"; else echo "这台机器没有 G-FRC+, 跳过第 6 组"; fi ;;
     7) run 7_sr_interp native "srip:1:$SR_FULL:$IP_MODE:$IP_FPS:$IP_TUNE" ;;
     8) if [ "$HAS_GFRC" = true ]; then run 8_interp_gfrc "layer+gfrc:101" "ip:$IP_MODE:$IP_FPS:stamp=0,panel=120,backend=sc,lead_ns=25000000,sc_dst=$GFRC_BUF+gfrc:101"; else echo "这台机器没有 G-FRC+, 跳过第 8 组"; fi ;;
+    10) run 10_interp_cost "ip:real:$IP_FPS:$IP_TUNE" "ip:$IP_MODE:$IP_FPS:$IP_TUNE" ;;
     9) if [ "$HAS_GFRC" = true ]; then run 9_gfrc111_vs_srip gfrc:111 "srip:1:$SR_FULL:$IP_MODE:$IP_FPS:stamp=0,panel=120,backend=sc,lead_ns=25000000+gfrc:101"; else echo "这台机器没有 G-FRC+, 跳过第 9 组"; fi ;;
   esac
 done

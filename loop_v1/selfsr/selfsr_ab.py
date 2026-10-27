@@ -17,6 +17,7 @@
   - SurfaceFlinger timestats: 上屏帧率 / 刷新率 / 丢帧
   - ftrace + phonefarm parse-trace: 游戏 GPU 提交 → 游戏渲染帧率 / p95 帧时
   - 截图: 锐度 (拉普拉斯方差), 与本轮第一张 native 截图的 SSIM (跨冷启动场景会有云/时辰差异, 只作参考)
+  - --power: 窗口内停充, 每秒读电池电流×电压 = 整机功耗 (mW) 与每个看到的帧的能耗 (mJ); 整轮亮度固定为手动、不改值
   - 游戏图层送显缓冲尺寸 (HWC 源); 挂层臂另读层 marker (层加载、窗口内帧数、selfsr 实际尺寸与计数)
   不挂层的臂整臂在 tools/devlock 下跑; 挂层的臂由 gray-layer session 持设备租约, 挂层并冷启动游戏,
   onboard --enter-only --no-cold 只导航不重启 (重启会丢层), 采完 stop 会话 (会话负责摘层)。
@@ -33,6 +34,9 @@ from gfrc_ab import Dev, parse_timestats, layer_src, sharpness, signflip, boot_c
 
 PKG_DEFAULT = "com.miHoYo.Yuanshen"
 DEV_TRACE = "/data/local/tmp/selfsr_ftrace_capture.sh"
+DEV_POWER = "/data/local/tmp/selfsr_power_sample.sh"
+CHG_NODE = "/sys/class/qcom-battery/charging_enabled"   # 高通停充开关; 停充后整机电流全部来自电池
+POWER_PRE = 5   # 停充后等电流稳定的秒数 (实测前 3~5 秒电流还在爬升)
 SR_PROP = "debug.knobs.selfsr"
 SR_OPTS = ("algo", "direct", "unlimit")   # → debug.knobs.selfsr_<键>; unlimit → debug.knobs.unlimit
 UNLIMIT_PROP = "debug.knobs.unlimit"
@@ -194,10 +198,25 @@ def measure(dev, a, name, out):
     tr = subprocess.Popen(f"adb -s {shlex.quote(a.serial)} shell su -c "
                           + shlex.quote(shlex.quote(f"sh {DEV_TRACE} {a.window} {dev_trace} {a.pkg}")),
                           shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    pw = None
+    if a.power:   # 先停充、等电流稳定, 再开 timestats 窗口, 两者对齐
+        pw = subprocess.Popen(f"adb -s {shlex.quote(a.serial)} shell su -c "
+                              + shlex.quote(shlex.quote(f"sh {DEV_POWER} {a.window} {POWER_PRE}")),
+                              shell=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        time.sleep(POWER_PRE)
     ts_text = dev.shell(ts_cmd, timeout=a.window + 60)
     ts = parse_timestats(ts_text, a.pkg)
     ts_sc = timestats_layer(ts_text, "selfsr_interp")   # 插帧子图层后端的图层
     tr.wait(timeout=a.window + 90)
+    power = {}
+    if pw is not None:
+        rows = [ln.split() for ln in pw.communicate(timeout=a.window + 60)[0].splitlines()]
+        rows = [[int(x) for x in r] for r in rows if len(r) == 3 and all(x.lstrip("-").isdigit() for x in r)]
+        mw = [-c * v / 1e9 for c, v, _ in rows]   # uA × uV → mW; 放电为负
+        power = {"power_mw": round(statistics.mean(mw), 1) if mw else None, "power_samples": len(mw),
+                 "power_charging_seen": any(c > 0 for c, _, _ in rows),
+                 "bat_temp_c": round(statistics.mean(t for _, _, t in rows) / 10, 1) if rows else None}
+        open(os.path.join(out, "traces", f"{name}_power.txt"), "w").write("\n".join(" ".join(map(str, r)) for r in rows) + "\n")
     sc = sc_layer_fps(dev, raw_path=os.path.join(out, "traces", f"{name}_sclat.txt"))
     local_trace = os.path.join(out, "traces", f"{name}.txt")
     dev.adb(f"exec-out su -c {shlex.quote('cat ' + dev_trace)} > {shlex.quote(local_trace)}")
@@ -227,7 +246,7 @@ def measure(dev, a, name, out):
             "seen_fps": sc.get("fps") or (round(ts["layer_frames"] / span, 2) if ts.get("layer_frames") else None),
             "game_fps": game.get("fps_mean"), "game_frame_p95_ms": game.get("frame_p95"),
             "gpu_active_ms": game.get("gpu_active_mean"),
-            "out_res": src, "sharp_full": sharpness(shot), "sharp_hud": sharpness(shot, HUD_BOX), "shot": shot}
+            "out_res": src, "sharp_full": sharpness(shot), "sharp_hud": sharpness(shot, HUD_BOX), "shot": shot, **power}
 
 
 def uptime_ns(dev):
@@ -573,6 +592,7 @@ def main():
     ap.add_argument("--session-seconds", type=int, default=1200)
     ap.add_argument("--cool-max", type=float, default=0, help="每臂开跑前电池温度要降到这个 °C 以下 (0 = 不等), 最多等 15 分钟")
     ap.add_argument("--fan", action="store_true", help="整轮开机身风扇最高档 (红魔 /sys/kernel/fan), 收尾写回原值; 没有该节点的机器跳过")
+    ap.add_argument("--power", action="store_true", help="测量窗口内停充采整机功耗 (高通机 + root, 见 loop_v1/tools/power_sample.sh)")
     ap.add_argument("--phonefarm", default=os.environ.get("PHONEFARM_BIN") or os.path.join(REPO, "phonefarm"))
     # _locked 内部用
     ap.add_argument("--what", default=None)
@@ -609,6 +629,7 @@ def main():
             dev.shell("; ".join(f"setprop {p} ''" for p in IP_PROPS))
             dev.shell("; ".join(f"setprop debug.knobs.interp_{t} ''" for t in IP_TUNE if t not in ("panel", "framepacing", "unlimit", "sfovr", "sfwait")))
             restore_panel(dev)
+            dev.su(f"[ -w {CHG_NODE} ] && echo 1 > {CHG_NODE}")   # 功耗采样被打断时也要恢复充电
             rec = {"game_mode": gm, "mode_now": current_mode(dev, a.pkg), "selfsr_prop": dev.prop(SR_PROP),
                    "game_gfrc_mode": dev.shell("settings get global game_gfrc_mode").strip(),
                    "interp_props": [dev.prop(p) for p in IP_PROPS]}
@@ -633,6 +654,8 @@ def main():
                os.path.abspath(__file__), "_locked", "--what", what, "--name", name, "--kind", k_str,
                "--orig-mode", orig_mode, "--serial", a.serial, "--pkg", a.pkg, "--out", out,
                "--settle", str(a.settle), "--window", str(a.window), "--phonefarm", a.phonefarm]
+        if a.power:
+            cmd += ["--power"]
         if a.enter_script:
             cmd += ["--enter-script", a.enter_script]
         r = None
@@ -681,6 +704,17 @@ def main():
             note("风扇: 本机没有已知的风扇节点, 跳过")
     dev.shell("settings put system screen_off_timeout 1800000")
     dev.adb(f"push {shlex.quote(os.path.join(REPO, 'loop_v1/tools/ftrace_capture.sh'))} {DEV_TRACE}", check=True)
+    bright_orig = None
+    if a.power:
+        if dev.su(f"[ -w {CHG_NODE} ] && echo yes").strip() != "yes":
+            note(f"--power: 这台机器没有可写的 {CHG_NODE}, 量不了整机功耗")
+            return 2
+        dev.adb(f"push {shlex.quote(os.path.join(REPO, 'loop_v1/tools/power_sample.sh'))} {DEV_POWER}", check=True)
+        # 自动亮度会随环境光变, 两臂功耗就不可比: 整轮固定为手动, 亮度值不动
+        bright_orig = (dev.shell("settings get system screen_brightness_mode").strip(),
+                       dev.shell("settings get system screen_brightness").strip())
+        dev.shell("settings put system screen_brightness_mode 0")
+        note(f"功耗: 窗口内停充采样; 亮度固定手动 {bright_orig[1]} (原模式 {bright_orig[0]})")
     stop = {"flag": False}
     signal.signal(signal.SIGINT, lambda *_: stop.update(flag=True))
     signal.signal(signal.SIGTERM, lambda *_: stop.update(flag=True))
@@ -719,6 +753,11 @@ def main():
                 rec = locked("plain", name, k_str)
             rec = {"arm": name, "side": arm, "kind": k_str, "pair": pair + 1, "seq": seq + 1, **rec, "cool_wait_s": cool_wait,
                    "t": time.time()}
+            if a.power and not rec.get("error"):
+                if rec.get("power_charging_seen"):
+                    rec["error"] = "功耗: 窗口内电池在充电 (停充没生效)"
+                elif not rec.get("power_samples"):
+                    rec["error"] = "功耗: 没采到样本"
             if rec.get("shot") and os.path.exists(rec["shot"]):
                 if k["kind"] == "native" and ref_shot is None and not rec.get("error"):
                     ref_shot = rec["shot"]
@@ -730,6 +769,7 @@ def main():
             else:
                 note(f"{name} ({k_str}): 显示 {rec.get('display_fps')} fps @{rec.get('display_hz')}Hz 游戏 {rec.get('game_fps')} fps "
                      f"p95 {rec.get('game_frame_p95_ms')} ms 锐度 {rec.get('sharp_full', 0):.1f} 输出 {rec.get('out_res')}"
+                     + (f" 功耗 {rec.get('power_mw')} mW" if rec.get('power_mw') is not None else "")
                      + (f" 层帧数 {rec.get('layer_frames_in_window')}" if uses_layer(k) else "")
                      + (f" 窗口上屏 {rec.get('interp_window')}" if rec.get('interp_window') else "")
                      + (f" 超分 {rec.get('selfsr_upscaled_in_window')} 次 {(rec.get('selfsr') or {}).get('game_extent')}→{(rec.get('selfsr') or {}).get('swap_extent')}" if k['kind'] in ('sr', 'srip') else ""))
@@ -745,6 +785,11 @@ def main():
             dev.su(f"echo {fan_orig[1]} > {HFAN}/fan_target_rpm")
             r["fan_restored"] = dev.su(f"cat {HFAN}/fan_target_rpm").split()
         dev.shell(f"settings put system screen_off_timeout {orig_timeout}")
+        if a.power:
+            dev.su(f"echo 1 > {CHG_NODE}")
+            r["charging_enabled"] = dev.su(f"cat {CHG_NODE}").strip()
+            if bright_orig and bright_orig[0] in ("0", "1"):
+                dev.shell(f"settings put system screen_brightness_mode {bright_orig[0]}")
         ok, info = layer_absent(dev, a.pkg)
         json.dump({**r, "layer_absent": ok, "layer_info": info}, open(os.path.join(out, "restore.json"), "w"), ensure_ascii=False)
         note(f"收尾核对: Game Mode {r.get('mode_now')} (原 {orig_mode}), selfsr 属性 '{r.get('selfsr_prop')}', "
@@ -754,7 +799,9 @@ def main():
             and (not uses_layer(parse_kind(r["kind"])) or (r.get("layer_loaded") and r.get("layer_removed")))]
     pairs = sorted({r["pair"] for r in good if sum(1 for x in good if x["pair"] == r["pair"]) == 2})
     metrics = ["seen_fps", "display_fps", "display_fps_sc", "sc_added_delay_p50_ms", "sc_interval_p95_ms", "game_fps", "game_frame_p95_ms", "gpu_active_ms", "sharp_full", "sharp_hud", "ssim_vs_native_ref", "missed_frames",
-               "display_latency_p50_ms", "displayed_per_s"]
+               "display_latency_p50_ms", "displayed_per_s", "power_mw", "mj_per_seen_frame", "bat_temp_c"]
+    for r in good:   # 每个看到的帧的能耗: 插帧把帧率翻倍时, 这个比总功耗更能说明效率
+        r["mj_per_seen_frame"] = round(r["power_mw"] / r["seen_fps"], 3) if r.get("power_mw") and r.get("seen_fps") else None
     res = {}
     for m in metrics:
         av = [next(x.get(m) for x in good if x["pair"] == p and x["side"] == "A") for p in pairs]
@@ -776,7 +823,8 @@ def main():
              "gpu_active_ms": "每帧 GPU 忙碌 (ms, 均值)",
              "display_latency_p50_ms": "真实帧 present→上屏 p50 (ms)",
              "displayed_per_s": "层回读: 窗口内每秒实际上屏 (真实+合成)",
-             "sharp_full": "锐度 (拉普拉斯方差)", "sharp_hud": "右上角固定图标区锐度", "ssim_vs_native_ref": "与第一张原生截图的 SSIM", "missed_frames": "SF 丢帧 / 窗口"}
+             "sharp_full": "锐度 (拉普拉斯方差)", "sharp_hud": "右上角固定图标区锐度", "ssim_vs_native_ref": "与第一张原生截图的 SSIM", "missed_frames": "SF 丢帧 / 窗口",
+             "power_mw": "整机功耗 (mW, 停充电池放电)", "mj_per_seen_frame": "每个看到的帧的能耗 (mJ)", "bat_temp_c": "窗口内电池温度 (°C)"}
     md = [f"# {ka} (A) vs {kb} (B): {a.pkg}", "",
           f"每臂冷启动进大世界, 有效 {len(pairs)} 对, 精确符号翻转检验 (最小可能 p = {report['min_p_possible']})。"
           f"游戏内设置未改。作废臂: {report['dropped_arms'] or '无'}。送显缓冲: {report['out_res']}", "",
