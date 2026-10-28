@@ -189,14 +189,25 @@ def pan_probe(dev, a, name, out):
     dev.shell(f"rm -f {remote}")
 
     def crop_diffs(box):
+        # 逐帧从 ffmpeg 管道读、边读边算相邻帧差: 整段 600 帧一次读进来转 float 要几 GB, 16 GB 的节点会被系统 SIGKILL
         vw, vh = map(int, subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
                                           "-of", "csv=p=0", local], capture_output=True, text=True).stdout.strip().split(","))
         x, yy = int(box[0] * vw) // 2 * 2, int(box[1] * vh) // 2 * 2
         w, h = (int(box[2] * vw) - x) // 2 * 2, (int(box[3] * vh) - yy) // 2 * 2
-        raw = subprocess.run(["ffmpeg", "-v", "error", "-i", local, "-vf", f"crop={w}:{h}:{x}:{yy},format=gray", "-f", "rawvideo", "-"],
-                             capture_output=True).stdout
-        f = np.frombuffer(raw, np.uint8).reshape(-1, h, w).astype(np.float32)
-        return f, np.abs(np.diff(f, axis=0)).mean(axis=(1, 2)) if len(f) > 1 else np.array([])
+        w2, h2 = w // 2, h // 2   # 再缩一半: 量的是平均差, 不需要全分辨率
+        p = subprocess.Popen(["ffmpeg", "-v", "error", "-i", local, "-vf", f"crop={w}:{h}:{x}:{yy},scale={w2}:{h2},format=gray",
+                              "-f", "rawvideo", "-"], stdout=subprocess.PIPE)
+        n, prev, d = 0, None, []
+        while True:
+            buf = p.stdout.read(w2 * h2)
+            if len(buf) < w2 * h2:
+                break
+            cur = np.frombuffer(buf, np.uint8).astype(np.int16)
+            if prev is not None:
+                d.append(float(np.abs(cur - prev).mean()))
+            prev, n = cur, n + 1
+        p.wait()
+        return n, np.array(d)
 
     try:
         hf, hd = crop_diffs(PAN_HUD)
@@ -206,7 +217,7 @@ def pan_probe(dev, a, name, out):
                                    capture_output=True, text=True).stdout.strip() or 0)
         return {"hud_flicker": round(float(hd[moving].mean()), 3) if moving.any() else None,
                 "pan_bg_motion": round(float(bd[moving].mean()), 3) if moving.any() else None,
-                "pan_moving_frames": int(moving.sum()), "pan_rec_fps": round(len(hf) / dur, 1) if dur else None}
+                "pan_moving_frames": int(moving.sum()), "pan_rec_fps": round(hf / dur, 1) if dur else None}
     except (ValueError, IndexError) as e:
         return {"pan_error": repr(e)[:200]}
 
