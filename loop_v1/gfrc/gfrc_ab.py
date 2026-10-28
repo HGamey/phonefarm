@@ -74,7 +74,7 @@ def parse_timestats(text, pkg):
     layer = None
     for blk in text.split("layerName = ")[1:]:
         name = blk.splitlines()[0]
-        if f"SurfaceView[{pkg}/" in name and "(BLAST)" in name:
+        if f"SurfaceView[{pkg}/" in name and "(BLAST)" in name and "selfsr_interp" not in name:   # 改了名的插帧子图层也带这个前缀
             m = re.search(r"^totalFrames = (\d+)", blk, re.M)
             layer = (name, int(m.group(1)) if m else None)
     g["layer"] = layer[0] if layer else None
@@ -86,7 +86,7 @@ def layer_src(sf_dump, pkg):
     """HWC 层表里游戏 BLAST 层的 Source Crop 宽高 (横屏: 取大者为宽)。"""
     lines = sf_dump.splitlines()
     for i, l in enumerate(lines):
-        if "SurfaceView[" in l and "(BLAST)" in l and pkg[:12] in l:
+        if "SurfaceView[" in l and "(BLAST)" in l and pkg[:12] in l and "selfsr_interp" not in l:
             for nxt in lines[i + 1:i + 3]:
                 cells = [c.strip() for c in nxt.split("|")]
                 # Source Crop: 4 个带小数点的数 (荣耀的表多一列 [*], 不能按固定列号取)

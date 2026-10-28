@@ -225,7 +225,7 @@ def pan_probe(dev, a, name, out):
 def sc_layer_fps(dev, windows=6, raw_path=None):
     """插帧子图层 (selfsr_interp) 的实际上屏帧率: SF --latency 的 actual-present 列, 每段 1 s (缓冲只存 128 帧)。
     timestats 不收这个子图层, 只能这样量。返回 {fps, interval_p50_ms, interval_p95_ms} 或 {}。"""
-    out = dev.shell("N=$(dumpsys SurfaceFlinger --list | grep -o '[^ ]*selfsr_interp#[0-9]*' | tail -1); [ -n \"$N\" ] || exit 0; "
+    out = dev.shell("N=$(dumpsys SurfaceFlinger --list | grep 'selfsr_interp#[0-9]*$' | tail -1 | sed 's/^ *//'); [ -n \"$N\" ] || exit 0; "
                     f"for i in $(seq {windows}); do dumpsys SurfaceFlinger --latency-clear >/dev/null; sleep 1; "
                     "echo ===; dumpsys SurfaceFlinger --latency \"$N\"; done; echo '### mode'; "
                     "dumpsys SurfaceFlinger | grep -iE 'activeMode|renderRate|vsyncRate|desiredMode' | head -12; "
@@ -315,7 +315,10 @@ def measure(dev, a, name, out):
                                                 if ts_sc.get("layer_frames") else None),
             "sc_interval_p95_ms": sc.get("interval_p95_ms"),
             # 看到的画面的帧率: 子图层插帧时游戏图层被盖住, 取子图层; 否则取游戏图层
-            "seen_fps": sc.get("fps") or (round(ts["layer_frames"] / span, 2) if ts.get("layer_frames") else None),
+            # (--latency 量不到时退回 timestats 里子图层的帧数, 再没有才取游戏图层)
+            "seen_fps": sc.get("fps") or (round(ts_sc["layer_frames"] / ((ts_sc.get("displayOnTime") or a.window * 1000) / 1000), 2)
+                                          if ts_sc.get("layer_frames") else None)
+                        or (round(ts["layer_frames"] / span, 2) if ts.get("layer_frames") else None),
             "game_fps": game.get("fps_mean"), "game_frame_p95_ms": game.get("frame_p95"),
             "gpu_active_ms": game.get("gpu_active_mean"),
             "out_res": src, "sharp_full": sharpness(shot), "sharp_hud": sharpness(shot, HUD_BOX), "shot": shot, **power, **pan}
