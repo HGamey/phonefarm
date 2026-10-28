@@ -4,6 +4,7 @@
 #include <android/log.h>
 #include <dlfcn.h>
 #include <unistd.h>
+#include <poll.h>
 #include <sys/system_properties.h>
 
 #include <cstdio>
@@ -13,6 +14,7 @@
 #include <deque>
 #include <map>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <time.h>
 
@@ -35,6 +37,10 @@ int32_t g_dst_w = 0, g_dst_h = 0;
 int g_pacer = 0;               // debug.knobs.interp_sc_pacer=1: 层自己的送显线程按时 apply, 不带 desiredPresentTime
 long g_margin_ns = 3000000;    // debug.knobs.interp_sc_margin_ns: 比定的上屏时刻提前多久 apply
 uint64_t g_pacer_late = 0;     // 轮到时已经过了定的时刻
+// debug.knobs.interp_sc_presig=1 (连带 pacer=1): 送显线程先等缓冲的 fence signal 再交, 交给 SF 的都是画完的缓冲
+// (红魔 SF waitframe 遇到 fence 没 signal 的缓冲会在 commit 里每 1 ms 轮询一次, 一等 7~8 ms, 下一个 vsync 整帧跳过)
+bool g_presig = false;
+uint64_t g_presig_wait = 0, g_presig_timeout = 0;
 bool g_vote_fixed = false;     // debug.knobs.interp_sc_vote=fixed
 int32_t g_xform_used = 0;
 // debug.knobs.interp_sc_winvote=<fps>: 改写游戏窗口自己的帧率投票 (游戏常投 60)。SF 按 uid 的帧率覆盖只放行「该 uid 的 vsync」上的事务,
@@ -65,6 +71,10 @@ bool requested() {
         char pc[PROP_VALUE_MAX] = {0};
         __system_property_get("debug.knobs.interp_sc_pacer", pc);
         g_pacer = pc[0] == '1' ? 1 : pc[0] == '2' ? 2 : 0;
+        char ps[PROP_VALUE_MAX] = {0};
+        __system_property_get("debug.knobs.interp_sc_presig", ps);
+        g_presig = ps[0] == '1';
+        if (g_presig && !g_pacer) g_pacer = 1;
         char mg[PROP_VALUE_MAX] = {0};
         __system_property_get("debug.knobs.interp_sc_margin_ns", mg);
         if (mg[0]) g_margin_ns = atol(mg);
@@ -304,7 +314,14 @@ bool sc_ready(VkDevice dev) {
         return false;
     }
     if (!D->sc) {
-        D->sc = g_api.createFromWindow(g_window, "selfsr_interp");
+        // debug.knobs.interp_sc_name=<前缀>: 图层名 = 前缀 + "selfsr_interp" (测量脚本按后缀找它)。
+        // 红魔 SF 的 waitframe 每帧等「游戏图层」的下一帧 (sc_noreal 时游戏图层不再更新, 每帧白等半个 vsync);
+        // 试把子图层起成游戏 SurfaceView 的名字, 看它认不认
+        char nm[PROP_VALUE_MAX] = {0};
+        __system_property_get("debug.knobs.interp_sc_name", nm);
+        std::string name = std::string(nm) + "selfsr_interp";
+        D->sc = g_api.createFromWindow(g_window, name.c_str());
+        SC_LOG("子图层名 %s", name.c_str());
         if (!D->sc) { g_reason = "create_surface_control"; return false; }
         SC_LOG("子图层已建");
     }
@@ -374,6 +391,17 @@ bool g_pbusy = false, g_pstarted = false;
 
 uint64_t mono_ns() { timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec; }
 
+// presig: 等 fence 做完 (最多 50 ms), 交给 SF 时不再带 fence
+int presig(int fd) {
+    if (!g_presig || fd < 0) return fd;
+    pollfd pf{fd, POLLIN, 0};
+    int r = poll(&pf, 1, 0);
+    if (r == 0) { g_presig_wait++; r = poll(&pf, 1, 50); }
+    if (r <= 0) { g_presig_timeout++; return fd; }   // 超时: 原样带 fence 交
+    close(fd);
+    return -1;
+}
+
 void pacer_loop() {
     for (;;) {
         PacerJob j;
@@ -391,6 +419,7 @@ void pacer_loop() {
         } else if (now > j.when) {
             g_pacer_late++;
         }
+        j.fd = presig(j.fd);
         ASurfaceTransaction* t = g_api.txnCreate();
         if (t) {
             g_api.setBuffer(t, j.sc, j.ahb, j.fd);   // fd 归事务
@@ -427,6 +456,7 @@ void choreo_cb(int64_t frame_ns, void*) {
         }
     }
     if (have) {
+        j.fd = presig(j.fd);
         ASurfaceTransaction* t = g_api.txnCreate();
         if (t) { g_api.setBuffer(t, j.sc, j.ahb, j.fd); g_api.txnApply(t); g_api.txnDelete(t); }
         else if (j.fd >= 0) close(j.fd);
@@ -638,9 +668,9 @@ bool sc_vsync_grid(uint64_t* phase, uint64_t* period) {
 
 std::string sc_json() {
     std::lock_guard<std::mutex> lk(g_m);
-    char b[512];
-    snprintf(b, sizeof b, "{\"requested\":%s,\"window\":%s,\"shown\":%llu,\"buffers_allocated\":%llu,\"pacer\":%d,\"margin_ns\":%ld,\"pacer_late\":%llu,\"vsync_cb\":%llu,\"vsync_sent\":%llu,\"xform\":%d,\"winvote\":%.0f,\"winvote_calls\":%llu,\"winvote_rc\":%d,\"kick_ns\":%ld,\"kicks\":%llu,\"grid\":%d,\"grid_cb\":%llu,\"grid_period_ns\":%llu,\"reason\":\"%s\"}",
+    char b[640];
+    snprintf(b, sizeof b, "{\"requested\":%s,\"window\":%s,\"shown\":%llu,\"buffers_allocated\":%llu,\"pacer\":%d,\"margin_ns\":%ld,\"pacer_late\":%llu,\"vsync_cb\":%llu,\"vsync_sent\":%llu,\"xform\":%d,\"winvote\":%.0f,\"winvote_calls\":%llu,\"winvote_rc\":%d,\"kick_ns\":%ld,\"kicks\":%llu,\"grid\":%d,\"grid_cb\":%llu,\"grid_period_ns\":%llu,\"presig\":%d,\"presig_wait\":%llu,\"presig_timeout\":%llu,\"reason\":\"%s\"}",
              g_req == 1 ? "true" : "false", g_window ? "true" : "false", (unsigned long long)g_shown,
-             (unsigned long long)g_alloc, g_pacer, g_margin_ns, (unsigned long long)g_pacer_late, (unsigned long long)g_vsync_cb, (unsigned long long)g_vsync_sent, g_xform_used, g_winvote, (unsigned long long)g_winvote_calls, g_winvote_rc, g_kick_ns, (unsigned long long)g_kicks, g_grid, (unsigned long long)g_gv_cb.load(), (unsigned long long)g_gv_period.load(), g_reason.c_str());
+             (unsigned long long)g_alloc, g_pacer, g_margin_ns, (unsigned long long)g_pacer_late, (unsigned long long)g_vsync_cb, (unsigned long long)g_vsync_sent, g_xform_used, g_winvote, (unsigned long long)g_winvote_calls, g_winvote_rc, g_kick_ns, (unsigned long long)g_kicks, g_grid, (unsigned long long)g_gv_cb.load(), (unsigned long long)g_gv_period.load(), (int)g_presig, (unsigned long long)g_presig_wait, (unsigned long long)g_presig_timeout, g_reason.c_str());
     return b;
 }

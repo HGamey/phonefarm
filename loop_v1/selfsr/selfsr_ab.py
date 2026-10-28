@@ -44,7 +44,7 @@ UNLIMIT_PROP = "debug.knobs.unlimit"
 # 截图 (2688x1216) 右上角那排固定图标: 整屏锐度被场景主导 (冷启动后角色/镜头可能不同), 这块内容各臂相同
 HUD_BOX = (1760, 10, 2600, 130)
 IP_PROPS = ("debug.knobs.interp", "debug.knobs.interp_mode", "debug.knobs.interp_fps")
-IP_TUNE = ("static", "sfovr", "sfwait", "sc_grid", "sc_real_wait", "sc_noreal", "sc_kick_ns", "sc_gap_ns", "sc_winvote", "sc_xform", "sc_vote", "sc_pacer", "sc_margin_ns", "sc_ring", "pacing", "stamp", "acquire_ms", "extra_images", "lead_ns", "mult", "backend", "sc_dst", "panel", "framepacing",
+IP_TUNE = ("static", "sfovr", "sfwait", "sc_grid", "sc_real_wait", "sc_noreal", "sc_presig", "sc_name", "sc_kick_ns", "sc_gap_ns", "sc_winvote", "sc_xform", "sc_vote", "sc_pacer", "sc_margin_ns", "sc_ring", "pacing", "stamp", "acquire_ms", "extra_images", "lead_ns", "mult", "backend", "sc_dst", "panel", "framepacing",
            "unlimit")
 FP_PROP = "vendor.perf.framepacing.enable"   # 高通 perf HAL 的游戏帧节奏; framepacing=<值> 进世界后设, 收尾写回原值   # panel 不是层属性, 见 prepare   # ip 臂第 4 段可设的 debug.knobs.interp_<键>
 
@@ -225,7 +225,7 @@ def pan_probe(dev, a, name, out):
 def sc_layer_fps(dev, windows=6, raw_path=None):
     """插帧子图层 (selfsr_interp) 的实际上屏帧率: SF --latency 的 actual-present 列, 每段 1 s (缓冲只存 128 帧)。
     timestats 不收这个子图层, 只能这样量。返回 {fps, interval_p50_ms, interval_p95_ms} 或 {}。"""
-    out = dev.shell("N=$(dumpsys SurfaceFlinger --list | grep -o 'selfsr_interp#[0-9]*' | tail -1); [ -n \"$N\" ] || exit 0; "
+    out = dev.shell("N=$(dumpsys SurfaceFlinger --list | grep -o '[^ ]*selfsr_interp#[0-9]*' | tail -1); [ -n \"$N\" ] || exit 0; "
                     f"for i in $(seq {windows}); do dumpsys SurfaceFlinger --latency-clear >/dev/null; sleep 1; "
                     "echo ===; dumpsys SurfaceFlinger --latency \"$N\"; done; echo '### mode'; "
                     "dumpsys SurfaceFlinger | grep -iE 'activeMode|renderRate|vsyncRate|desiredMode' | head -12; "
@@ -244,6 +244,19 @@ def sc_layer_fps(dev, windows=6, raw_path=None):
     iv.sort()
     return {"fps": round(statistics.mean(fps), 2), "interval_p50_ms": round(iv[len(iv) // 2], 2),
             "interval_p95_ms": round(iv[int(len(iv) * 0.95)], 2)}
+
+
+# 窗口后抓 3 s SF 的 atrace (gfx), 数红魔 waitframe 的三个痕迹: commit 等 fence 没 signal 的缓冲 / 整帧跳过 / 缓冲被后一张顶掉
+SF_MARKS = {"sf_fence_unsignaled": "fence unsignaled", "sf_not_composited": "onCommitNotComposited", "sf_release_pending": "releasePendingBuffer"}
+
+
+def sf_atrace(dev, name, out, secs=3):
+    txt = dev.su(f"atrace -b 65536 -t {secs} gfx view", timeout=secs + 30) or ""
+    open(os.path.join(out, "traces", f"{name}_atrace.txt"), "w").write(txt)
+    r = {k: round(txt.count(v) / secs, 1) for k, v in SF_MARKS.items()}
+    # 等的是谁的缓冲: fence unsignaled 行前后常带图层名, 留几行样本
+    r["sf_fence_samples"] = [ln.strip()[-160:] for ln in txt.splitlines() if "fence unsignaled" in ln][:5]
+    return r
 
 
 def measure(dev, a, name, out):
@@ -275,6 +288,7 @@ def measure(dev, a, name, out):
                  "bat_temp_c": round(statistics.mean(t for _, _, t in rows) / 10, 1) if rows else None}
         open(os.path.join(out, "traces", f"{name}_power.txt"), "w").write("\n".join(" ".join(map(str, r)) for r in rows) + "\n")
     sc = sc_layer_fps(dev, raw_path=os.path.join(out, "traces", f"{name}_sclat.txt"))
+    sfa = sf_atrace(dev, name, out) if a.sf_atrace else {}
     local_trace = os.path.join(out, "traces", f"{name}.txt")
     dev.adb(f"exec-out su -c {shlex.quote('cat ' + dev_trace)} > {shlex.quote(local_trace)}")
     dev.su(f"rm -f {dev_trace}")
@@ -294,7 +308,7 @@ def measure(dev, a, name, out):
     dev.adb(f"exec-out screencap -p > {shlex.quote(shot)}")
     pan = pan_probe(dev, a, name, out) if a.pan else {}
     span = (ts.get("displayOnTime") or a.window * 1000) / 1000
-    return {"in_game": a.pkg in fg,
+    return {**sfa, "in_game": a.pkg in fg,
             "display_fps": round(ts["layer_frames"] / span, 2) if ts.get("layer_frames") else None,
             "display_hz": ts.get("display_hz"), "missed_frames": ts.get("missedFrames"),
             "display_fps_sc": sc.get("fps") or (round(ts_sc["layer_frames"] / ((ts_sc.get("displayOnTime") or a.window * 1000) / 1000), 2)
@@ -656,6 +670,7 @@ def main():
     ap.add_argument("--cool-max", type=float, default=0, help="每臂开跑前电池温度要降到这个 °C 以下 (0 = 不等), 最多等 15 分钟")
     ap.add_argument("--fan", action="store_true", help="整轮开机身风扇最高档 (红魔 /sys/kernel/fan), 收尾写回原值; 没有该节点的机器跳过")
     ap.add_argument("--pan", action="store_true", help="窗口后录屏 + 拖视角, 量 HUD 重影 (原神右下技能区)")
+    ap.add_argument("--sf-atrace", action="store_true", help="窗口后抓 3 s SF atrace, 每秒数 waitframe 等 fence / 整帧跳过 / 缓冲被顶掉 (要 root)")
     ap.add_argument("--power", action="store_true", help="测量窗口内停充采整机功耗 (高通机 + root, 见 loop_v1/tools/power_sample.sh)")
     ap.add_argument("--phonefarm", default=os.environ.get("PHONEFARM_BIN") or os.path.join(REPO, "phonefarm"))
     # _locked 内部用
