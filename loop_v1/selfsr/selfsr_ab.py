@@ -225,7 +225,7 @@ def pan_probe(dev, a, name, out):
 def sc_layer_fps(dev, windows=6, raw_path=None):
     """插帧子图层 (selfsr_interp) 的实际上屏帧率: SF --latency 的 actual-present 列, 每段 1 s (缓冲只存 128 帧)。
     timestats 不收这个子图层, 只能这样量。返回 {fps, interval_p50_ms, interval_p95_ms} 或 {}。"""
-    out = dev.shell("N=$(dumpsys SurfaceFlinger --list | grep 'selfsr_interp#[0-9]*$' | tail -1 | sed 's/^ *//'); [ -n \"$N\" ] || exit 0; "
+    out = dev.shell("N=$(dumpsys SurfaceFlinger --list | grep -o '[^{ ]*selfsr_interp#[0-9]*' | tail -1); [ -n \"$N\" ] || exit 0; "
                     f"for i in $(seq {windows}); do dumpsys SurfaceFlinger --latency-clear >/dev/null; sleep 1; "
                     "echo ===; dumpsys SurfaceFlinger --latency \"$N\"; done; echo '### mode'; "
                     "dumpsys SurfaceFlinger | grep -iE 'activeMode|renderRate|vsyncRate|desiredMode' | head -12; "
