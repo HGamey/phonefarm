@@ -2,6 +2,11 @@
 // 路线 B 第 5 步: 合成输出。重新按运动场反向采样两帧取平均 (不另存全分辨率预对齐缓冲, 重算比读写 float 缓冲便宜),
 // 加上 NPU 输出的残差 (int8 NHWC 3 通道, 分辨率 rw x rh, 解量化后双线性放大、乘 255), 取整写进 rgba8 输出;
 // HUD 框内直接取离目标时刻更近的一帧。与 I1 convert_anvil.py 半分辨率评估的 fb + resize(r)*255 一致。
+// 静止保护 (st_thr > 0, debug.knobs.interp_static): 两帧在某点附近几乎不变 (十字 5 点平均色差 < st_thr) 就当它是
+// 静止的 (HUD、文字、图标): 该点不做运动补偿, 直接取两帧平均; 运动采样落在静止点上 (把 HUD 拖出来的残影) 就丢掉
+// 这个样本、用另一侧的。不用标框, 换游戏不用改。
+// st_thr < 0 是比较模式: 不补偿时两帧的差 (十字 5 点) 比按运动补偿取样后的差还小 |st_thr| 以上, 就不补偿。
+// 半透明 HUD 底下场景在动, 色差判不成静止; 但它的边缘不补偿时对得更齐, 比较模式能判出来。
 // 调度: x = ceil(W/8), y = ceil(H/8)。
 #define FLOW_BINDING 2
 #define HUD_BINDING 5
@@ -13,8 +18,33 @@ layout(std430, binding = 3) readonly buffer Res { uint d[]; } res;   // rh*rw*3 
 layout(binding = 4, rgba8) uniform writeonly image2D dst;
 layout(push_constant) uniform P {
     int W; int H; int gw; int gh; float cell; int rw; int rh;
-    float t; float res_scale; float res_zp; int hud_on;
+    float t; float res_scale; float res_zp; int hud_on; float st_thr;
 } pc;
+
+// 两帧在 q 附近的平均色差 (0..1), 十字 5 点
+float still_diff(ivec2 q) {
+    ivec2 m = ivec2(pc.W - 1, pc.H - 1);
+    float d = 0.0;
+    const ivec2 o[5] = ivec2[5](ivec2(0, 0), ivec2(2, 0), ivec2(-2, 0), ivec2(0, 2), ivec2(0, -2));
+    for (int i = 0; i < 5; i++) {
+        ivec2 r = clamp(q + o[i], ivec2(0), m);
+        vec3 e = abs(texelFetch(f0, r, 0).rgb - texelFetch(f1, r, 0).rgb);
+        d += max(e.r, max(e.g, e.b));
+    }
+    return d * 0.2;
+}
+// 按运动 v 补偿取样后两帧在 q 附近的平均色差 (0..1), 十字 5 点
+float warp_diff(vec2 q, vec2 v) {
+    ivec2 full = ivec2(pc.W, pc.H);
+    float d = 0.0;
+    const vec2 o[5] = vec2[5](vec2(0, 0), vec2(2, 0), vec2(-2, 0), vec2(0, 2), vec2(0, -2));
+    for (int i = 0; i < 5; i++) {
+        vec3 e = abs(warp255(f0, q + o[i] - pc.t * v, full) - warp255(f1, q + o[i] + (1.0 - pc.t) * v, full));
+        d += max(e.r, max(e.g, e.b));
+    }
+    return d * (0.2 / 255.0);
+}
+bool still(vec2 q) { return still_diff(ivec2(floor(q + 0.5))) < pc.st_thr; }
 
 float res_at(int x, int y, int c) {
     uint i = uint((y * pc.rw + x) * 3 + c);
@@ -33,6 +63,22 @@ void main() {
         vec2 v = flow_at(pf, pc.gw, pc.gh, pc.cell);
         vec3 a = warp255(f0, pf - pc.t * v, full);
         vec3 b = warp255(f1, pf + (1.0 - pc.t) * v, full);
+        if (pc.st_thr < 0.0) {
+            if (dot(v, v) > 1.0 && still_diff(p) - pc.st_thr < warp_diff(pf, v)) {
+                a = texelFetch(f0, p, 0).rgb * 255.0;
+                b = texelFetch(f1, p, 0).rgb * 255.0;
+            }
+        } else if (pc.st_thr > 0.0) {
+            if (still(pf)) {   // 本点静止: 不补偿运动
+                a = texelFetch(f0, p, 0).rgb * 255.0;
+                b = texelFetch(f1, p, 0).rgb * 255.0;
+            } else if (dot(v, v) > 1.0) {   // 本点在动, 但采样点是静止的: 那是被拖出来的 HUD, 丢掉
+                bool sa = still(pf - pc.t * v), sb = still(pf + (1.0 - pc.t) * v);
+                if (sa && !sb) a = b;
+                else if (sb && !sa) b = a;
+                else if (sa && sb) { a = texelFetch(f0, p, 0).rgb * 255.0; b = texelFetch(f1, p, 0).rgb * 255.0; }
+            }
+        }
         int x0, x1, y0, y1; float ax, ay;
         up_coord(p.x, pc.W, pc.rw, x0, x1, ax);
         up_coord(p.y, pc.H, pc.rh, y0, y1, ay);

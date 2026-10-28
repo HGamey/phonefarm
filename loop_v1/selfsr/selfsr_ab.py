@@ -17,6 +17,7 @@
   - SurfaceFlinger timestats: 上屏帧率 / 刷新率 / 丢帧
   - ftrace + phonefarm parse-trace: 游戏 GPU 提交 → 游戏渲染帧率 / p95 帧时
   - 截图: 锐度 (拉普拉斯方差), 与本轮第一张 native 截图的 SSIM (跨冷启动场景会有云/时辰差异, 只作参考)
+  - --pan: 窗口后录 5 秒屏、期间拖动视角, 量 HUD 区相邻帧平均差 (重影越重越大) 与画面中央的帧间差 (证明在转)
   - --power: 窗口内停充, 每秒读电池电流×电压 = 整机功耗 (mW) 与每个看到的帧的能耗 (mJ); 整轮亮度固定为手动、不改值
   - 游戏图层送显缓冲尺寸 (HWC 源); 挂层臂另读层 marker (层加载、窗口内帧数、selfsr 实际尺寸与计数)
   不挂层的臂整臂在 tools/devlock 下跑; 挂层的臂由 gray-layer session 持设备租约, 挂层并冷启动游戏,
@@ -43,7 +44,7 @@ UNLIMIT_PROP = "debug.knobs.unlimit"
 # 截图 (2688x1216) 右上角那排固定图标: 整屏锐度被场景主导 (冷启动后角色/镜头可能不同), 这块内容各臂相同
 HUD_BOX = (1760, 10, 2600, 130)
 IP_PROPS = ("debug.knobs.interp", "debug.knobs.interp_mode", "debug.knobs.interp_fps")
-IP_TUNE = ("sfovr", "sfwait", "sc_grid", "sc_real_wait", "sc_kick_ns", "sc_gap_ns", "sc_winvote", "sc_xform", "sc_vote", "sc_pacer", "sc_margin_ns", "sc_ring", "pacing", "stamp", "acquire_ms", "extra_images", "lead_ns", "mult", "backend", "sc_dst", "panel", "framepacing",
+IP_TUNE = ("static", "sfovr", "sfwait", "sc_grid", "sc_real_wait", "sc_kick_ns", "sc_gap_ns", "sc_winvote", "sc_xform", "sc_vote", "sc_pacer", "sc_margin_ns", "sc_ring", "pacing", "stamp", "acquire_ms", "extra_images", "lead_ns", "mult", "backend", "sc_dst", "panel", "framepacing",
            "unlimit")
 FP_PROP = "vendor.perf.framepacing.enable"   # 高通 perf HAL 的游戏帧节奏; framepacing=<值> 进世界后设, 收尾写回原值   # panel 不是层属性, 见 prepare   # ip 臂第 4 段可设的 debug.knobs.interp_<键>
 
@@ -165,6 +166,51 @@ def timestats_layer(text, needle):
     return g
 
 
+PAN_HUD = (0.80, 0.70, 0.995, 0.97)   # 右下技能按钮区 (横屏比例 x0,y0,x1,y1): 不透明、固定, 转视角时背景在它周围动
+PAN_BG = (0.30, 0.25, 0.70, 0.75)     # 画面中央: 转视角时全是运动
+
+
+def pan_probe(dev, a, name, out):
+    """录 PAN_SECONDS 秒屏, 期间在右半屏横向来回拖视角; 返回 HUD 区与中央区的相邻帧平均差 (0..255) 和录到的帧率。"""
+    import numpy as np
+    W, H = map(int, re.findall(r"(\d+)x(\d+)", dev.shell("wm size"))[-1])
+    W, H = max(W, H), min(W, H)
+    remote = "/data/local/tmp/selfsr_pan.mp4"
+    rec = subprocess.Popen(["adb", "-s", a.serial, "shell", "screenrecord", "--time-limit", "5", "--bit-rate", "40000000", remote],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(0.8)
+    y = int(H * 0.45)
+    for i in range(4):   # 原神: 右半屏空白处拖动 = 转视角
+        x0, x1 = (int(W * 0.55), int(W * 0.85)) if i % 2 == 0 else (int(W * 0.85), int(W * 0.55))
+        dev.shell(f"input swipe {x0} {y} {x1} {y} 700")
+    rec.wait(timeout=30)
+    local = os.path.join(out, "traces", f"{name}_pan.mp4")
+    dev.adb(f"pull {remote} {shlex.quote(local)}")
+    dev.shell(f"rm -f {remote}")
+
+    def crop_diffs(box):
+        vw, vh = map(int, subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
+                                          "-of", "csv=p=0", local], capture_output=True, text=True).stdout.strip().split(","))
+        x, yy = int(box[0] * vw) // 2 * 2, int(box[1] * vh) // 2 * 2
+        w, h = (int(box[2] * vw) - x) // 2 * 2, (int(box[3] * vh) - yy) // 2 * 2
+        raw = subprocess.run(["ffmpeg", "-v", "error", "-i", local, "-vf", f"crop={w}:{h}:{x}:{yy},format=gray", "-f", "rawvideo", "-"],
+                             capture_output=True).stdout
+        f = np.frombuffer(raw, np.uint8).reshape(-1, h, w).astype(np.float32)
+        return f, np.abs(np.diff(f, axis=0)).mean(axis=(1, 2)) if len(f) > 1 else np.array([])
+
+    try:
+        hf, hd = crop_diffs(PAN_HUD)
+        _, bd = crop_diffs(PAN_BG)
+        moving = bd > 1.0   # 只算画面确实在动的相邻帧 (拖动前后静止段不算)
+        dur = float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", local],
+                                   capture_output=True, text=True).stdout.strip() or 0)
+        return {"hud_flicker": round(float(hd[moving].mean()), 3) if moving.any() else None,
+                "pan_bg_motion": round(float(bd[moving].mean()), 3) if moving.any() else None,
+                "pan_moving_frames": int(moving.sum()), "pan_rec_fps": round(len(hf) / dur, 1) if dur else None}
+    except (ValueError, IndexError) as e:
+        return {"pan_error": repr(e)[:200]}
+
+
 def sc_layer_fps(dev, windows=6, raw_path=None):
     """插帧子图层 (selfsr_interp) 的实际上屏帧率: SF --latency 的 actual-present 列, 每段 1 s (缓冲只存 128 帧)。
     timestats 不收这个子图层, 只能这样量。返回 {fps, interval_p50_ms, interval_p95_ms} 或 {}。"""
@@ -235,6 +281,7 @@ def measure(dev, a, name, out):
     open(os.path.join(out, "traces", f"{name}_sf.txt"), "w").write("\n".join(keep) + "\n")
     shot = os.path.join(out, "shots", f"{name}.png")
     dev.adb(f"exec-out screencap -p > {shlex.quote(shot)}")
+    pan = pan_probe(dev, a, name, out) if a.pan else {}
     span = (ts.get("displayOnTime") or a.window * 1000) / 1000
     return {"in_game": a.pkg in fg,
             "display_fps": round(ts["layer_frames"] / span, 2) if ts.get("layer_frames") else None,
@@ -246,7 +293,7 @@ def measure(dev, a, name, out):
             "seen_fps": sc.get("fps") or (round(ts["layer_frames"] / span, 2) if ts.get("layer_frames") else None),
             "game_fps": game.get("fps_mean"), "game_frame_p95_ms": game.get("frame_p95"),
             "gpu_active_ms": game.get("gpu_active_mean"),
-            "out_res": src, "sharp_full": sharpness(shot), "sharp_hud": sharpness(shot, HUD_BOX), "shot": shot, **power}
+            "out_res": src, "sharp_full": sharpness(shot), "sharp_hud": sharpness(shot, HUD_BOX), "shot": shot, **power, **pan}
 
 
 def uptime_ns(dev):
@@ -480,7 +527,12 @@ def arm_layer(a, out, name, k, note, locked):
             return rec
         panel = (k.get("tune") or {}).get("panel")
         if panel:   # 进世界后再设刷新率 (红魔 refresh_rate_mode), 回读 SF 刷新周期确认
-            dev.shell(f"settings put system refresh_rate_mode {PANEL_MODE[str(panel)]}")
+            want = str(PANEL_MODE[str(panel)])
+            if dev.shell("settings get system refresh_rate_mode").strip() == want:
+                # 值没变 settings 不发变更通知, 屏幕停在游戏自己要的刷新率 (残留原值时真机 60 Hz): 先写 0 再写目标
+                dev.shell("settings put system refresh_rate_mode 0")
+                time.sleep(1)
+            dev.shell(f"settings put system refresh_rate_mode {want}")
             time.sleep(4)
             per = dev.shell("dumpsys SurfaceFlinger | grep -m1 mPeriod")
             rec["panel_period"] = per.strip()
@@ -592,6 +644,7 @@ def main():
     ap.add_argument("--session-seconds", type=int, default=1200)
     ap.add_argument("--cool-max", type=float, default=0, help="每臂开跑前电池温度要降到这个 °C 以下 (0 = 不等), 最多等 15 分钟")
     ap.add_argument("--fan", action="store_true", help="整轮开机身风扇最高档 (红魔 /sys/kernel/fan), 收尾写回原值; 没有该节点的机器跳过")
+    ap.add_argument("--pan", action="store_true", help="窗口后录屏 + 拖视角, 量 HUD 重影 (原神右下技能区)")
     ap.add_argument("--power", action="store_true", help="测量窗口内停充采整机功耗 (高通机 + root, 见 loop_v1/tools/power_sample.sh)")
     ap.add_argument("--phonefarm", default=os.environ.get("PHONEFARM_BIN") or os.path.join(REPO, "phonefarm"))
     # _locked 内部用
@@ -656,6 +709,8 @@ def main():
                "--settle", str(a.settle), "--window", str(a.window), "--phonefarm", a.phonefarm]
         if a.power:
             cmd += ["--power"]
+        if a.pan:
+            cmd += ["--pan"]
         if a.enter_script:
             cmd += ["--enter-script", a.enter_script]
         r = None
@@ -799,7 +854,7 @@ def main():
             and (not uses_layer(parse_kind(r["kind"])) or (r.get("layer_loaded") and r.get("layer_removed")))]
     pairs = sorted({r["pair"] for r in good if sum(1 for x in good if x["pair"] == r["pair"]) == 2})
     metrics = ["seen_fps", "display_fps", "display_fps_sc", "sc_added_delay_p50_ms", "sc_interval_p95_ms", "game_fps", "game_frame_p95_ms", "gpu_active_ms", "sharp_full", "sharp_hud", "ssim_vs_native_ref", "missed_frames",
-               "display_latency_p50_ms", "displayed_per_s", "power_mw", "mj_per_seen_frame", "bat_temp_c"]
+               "display_latency_p50_ms", "displayed_per_s", "power_mw", "mj_per_seen_frame", "bat_temp_c", "hud_flicker", "pan_bg_motion", "pan_rec_fps"]
     for r in good:   # 每个看到的帧的能耗: 插帧把帧率翻倍时, 这个比总功耗更能说明效率
         r["mj_per_seen_frame"] = round(r["power_mw"] / r["seen_fps"], 3) if r.get("power_mw") and r.get("seen_fps") else None
     res = {}
@@ -824,7 +879,9 @@ def main():
              "display_latency_p50_ms": "真实帧 present→上屏 p50 (ms)",
              "displayed_per_s": "层回读: 窗口内每秒实际上屏 (真实+合成)",
              "sharp_full": "锐度 (拉普拉斯方差)", "sharp_hud": "右上角固定图标区锐度", "ssim_vs_native_ref": "与第一张原生截图的 SSIM", "missed_frames": "SF 丢帧 / 窗口",
-             "power_mw": "整机功耗 (mW, 停充电池放电)", "mj_per_seen_frame": "每个看到的帧的能耗 (mJ)", "bat_temp_c": "窗口内电池温度 (°C)"}
+             "power_mw": "整机功耗 (mW, 停充电池放电)", "mj_per_seen_frame": "每个看到的帧的能耗 (mJ)", "bat_temp_c": "窗口内电池温度 (°C)",
+             "hud_flicker": "转视角时 HUD 区相邻帧平均差 (越小重影越轻)", "pan_bg_motion": "转视角时画面中央相邻帧平均差 (运动量)",
+             "pan_rec_fps": "录屏帧率"}
     md = [f"# {ka} (A) vs {kb} (B): {a.pkg}", "",
           f"每臂冷启动进大世界, 有效 {len(pairs)} 对, 精确符号翻转检验 (最小可能 p = {report['min_p_possible']})。"
           f"游戏内设置未改。作废臂: {report['dropped_arms'] or '无'}。送显缓冲: {report['out_res']}", "",

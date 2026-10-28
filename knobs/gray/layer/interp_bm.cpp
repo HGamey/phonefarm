@@ -11,7 +11,9 @@
 #include "interp.h"
 
 #include <android/log.h>
+#include <sys/system_properties.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -48,6 +50,7 @@ struct Stage {
 
 struct Res {
     bool tried = false, ok = false, zeroed = false;
+    float st_thr = 0.f;   // 静止保护阈值 (0..1); debug.knobs.interp_static=<0..255 色阶>, 0/空 = 关; 负数 = 比较模式, 绝对值是余量
     uint64_t flow_frame = UINT64_MAX;   // 运动场是哪一帧算的 (同一帧插多张时只算一次)
     uint32_t W = 0, H = 0, qw = 0, qh = 0, gw = 0, gh = 0;
     VkImage C = VK_NULL_HANDLE, O = VK_NULL_HANDLE;
@@ -188,7 +191,7 @@ bool build(VkDevice dev, Fn& f, Res& R, uint32_t W, uint32_t H) {
     if (!make_stage(dev, f, R.pool, t_luma, 4, 16, kInterpBLumaSpv, kInterpBLumaSpvLen, R.luma) ||
         !make_stage(dev, f, R.pool, t_bm, 3, 16, kInterpBBmSpv, kInterpBBmSpvLen, R.bm) ||
         !make_stage(dev, f, R.pool, t_smooth, 2, 12, kInterpBSmoothSpv, kInterpBSmoothSpvLen, R.smooth) ||
-        !make_stage(dev, f, R.pool, t_comp, 6, 44, kInterpBComposeSpv, kInterpBComposeSpvLen, R.compose))
+        !make_stage(dev, f, R.pool, t_comp, 6, 48, kInterpBComposeSpv, kInterpBComposeSpvLen, R.compose))
         return false;
     // 不随帧变的绑定 (H 的视图每帧可能不同, 在 synth 里写 binding 0)
     write_img(dev, f, R.luma.set, 1, CIS, R.sampler, R.C_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -231,6 +234,9 @@ bool synth_bm(const IpSynthCtx& c, void*) {
         if (R.tried && (R.W != c.w || R.H != c.h)) R = Res{};   // 尺寸变了: 旧对象不收 (极少见), 重建
         R.tried = true;
         R.ok = load(c.dev, c.gdpa, f) && build(c.dev, f, R, c.w, c.h);
+        char sv[PROP_VALUE_MAX] = {0};
+        if (__system_property_get("debug.knobs.interp_static", sv) > 0) R.st_thr = strtof(sv, nullptr) / 255.f;
+        BM_LOG("静止保护阈值 %.1f/255", R.st_thr * 255.f);
         if (!R.ok) BM_LOG("建资源失败, 退回 dup");
     }
     if (!R.ok) { g_declined++; return false; }
@@ -292,8 +298,8 @@ bool synth_bm(const IpSynthCtx& c, void*) {
     }
     // 4. 合成 t (缺省 0.5; 多帧插时 k/(m+1))
     img_barrier(f, cb, R.O, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT, CS, CS);
-    struct { int32_t W, H, gw, gh; float cell; int32_t rw, rh; float t, res_scale, res_zp; int32_t hud_on; } p_c{
-        (int32_t)c.w, (int32_t)c.h, (int32_t)R.gw, (int32_t)R.gh, 32.f, 1, 1, c.t, 0.f, 0.f, 0};
+    struct { int32_t W, H, gw, gh; float cell; int32_t rw, rh; float t, res_scale, res_zp; int32_t hud_on; float st_thr; } p_c{
+        (int32_t)c.w, (int32_t)c.h, (int32_t)R.gw, (int32_t)R.gh, 32.f, 1, 1, c.t, 0.f, 0.f, 0, R.st_thr};
     f.CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, R.compose.pipe);
     f.CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, R.compose.pl, 0, 1, &R.compose.set, 0, nullptr);
     f.CmdPushConstants(cb, R.compose.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof p_c, &p_c);
