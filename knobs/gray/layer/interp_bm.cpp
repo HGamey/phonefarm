@@ -50,7 +50,7 @@ struct Stage {
 
 struct Res {
     bool tried = false, ok = false, zeroed = false;
-    float st_thr = 0.f;   // 静止保护阈值 (0..1); debug.knobs.interp_static=<0..255 色阶>, 0/空 = 关; 负数 = 比较模式, 绝对值是余量
+    float st_thr = 32.f / 255.f;   // 静止保护阈值 (0..1); debug.knobs.interp_static=<0..255 色阶>, 空 = 默认 32 (第 11 组定的), 0 = 关; 负数 = 比较模式, 绝对值是余量
     uint64_t flow_frame = UINT64_MAX;   // 运动场是哪一帧算的 (同一帧插多张时只算一次)
     uint32_t W = 0, H = 0, qw = 0, qh = 0, gw = 0, gh = 0;
     VkImage C = VK_NULL_HANDLE, O = VK_NULL_HANDLE;

@@ -472,7 +472,7 @@ def prepare(a, k, orig_mode):
     dev.shell(f"setprop {IP_PROPS[0]} {'1' if mode else shlex.quote('')}; setprop {IP_PROPS[1]} {shlex.quote(mode or '')}; "
            f"setprop {IP_PROPS[2]} {shlex.quote(k.get('fps') or '')}")
     tune = k.get("tune") or {}
-    dev.shell("; ".join(f"setprop debug.knobs.interp_{t} {shlex.quote(str(tune.get(t, '')))}" for t in IP_TUNE if t not in ("panel", "framepacing", "unlimit", "sfovr", "sfwait")))
+    dev.shell("; ".join(f"setprop debug.knobs.interp_{t} {shlex.quote(str(tune.get(t, '0' if t == 'static' else '')))}" for t in IP_TUNE if t not in ("panel", "framepacing", "unlimit", "sfovr", "sfwait")))
     # panel=<Hz>: 屏幕刷新率 (红魔 refresh_rate_mode), 收尾 (restore) 按开跑前记下的原值写回
     # 刷新率在进世界之后才设 (arm_layer): 原神启动时游戏助手会把它压回 60 Hz
     restore_panel(dev)

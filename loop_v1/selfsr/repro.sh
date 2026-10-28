@@ -13,7 +13,7 @@
 #   9. gfrc:111 vs srip:1:$SR_FULL:...+gfrc:101       自研超分 + 插帧 vs G-FRC+ 超分 + 插帧, 第 5 步, 同上
 #  11. ip:$IP_MODE vs 同上 + static=$STATIC           静止保护 (HUD 不被拖出重影, 不用标框); 配 PAN=1 量转视角时的 HUD 重影
 #  10. ip:real vs ip:$IP_MODE (同一套参数)            插帧合成本身的代价: 两臂都 120 Hz、都走子图层, 对照臂只送真实帧不合成 (拆功耗用)
-# 环境变量: PAN (1 = 窗口后录屏转视角量 HUD 重影) STATIC (第 11 组阈值, 0..255 色阶, 缺省 8) POWER (1 = 窗口内停充采整机功耗, 高通机) WINDOW (测量窗口秒数, 缺省 10; 量功耗建议 30) ENTER_SCRIPT (onboard 认不出时的进门脚本) KEEP_LAYER_PROP (1 = 全程保留层属性)
+# 环境变量: PAN (1 = 窗口后录屏转视角量 HUD 重影) STATIC (第 11 组阈值, 0..255 色阶, 缺省 32; 层本身不设属性时也默认 32, 对比臂没写 static 的一律显式关) POWER (1 = 窗口内停充采整机功耗, 高通机) WINDOW (测量窗口秒数, 缺省 10; 量功耗建议 30) ENTER_SCRIPT (onboard 认不出时的进门脚本) KEEP_LAYER_PROP (1 = 全程保留层属性)
 #           SR_SHARP (满分辨率超分锐化, 缺省 1.0; Megacity 0) SR_FULL (本机屏幕:SR_SHARP) SR_SCALE (0.56) SR_OUT (2141x969:0.8) IP_MODE (bm) IP_FPS (120) GFRC_BUF (G-FRC+ 放大后的缓冲, 缺省 3214x1456)
 #           IP_TUNE (stamp=0,panel=120,backend=sc,lead_ns=25000000; 带 waitframe 的系统另加 ,unlimit=1,sfwait=off) COOL_MAX (42) SETS ("1 2 3 4 5 6 7 8 9")
 # 前提: 手机已 root、游戏已装好并登录过 (onboard 能进大世界)。层用 knobs/gray/build/build_layer.sh 现编。
@@ -73,7 +73,7 @@ for g in $SETS; do
     6) if [ "$HAS_GFRC" = true ]; then run 6_gfrc_vs_sr gfrc:101 "sr:1:$SR_FULL+gfrc:101"; else echo "这台机器没有 G-FRC+, 跳过第 6 组"; fi ;;
     7) run 7_sr_interp native "srip:1:$SR_FULL:$IP_MODE:$IP_FPS:$IP_TUNE" ;;
     8) if [ "$HAS_GFRC" = true ]; then run 8_interp_gfrc "layer+gfrc:101" "ip:$IP_MODE:$IP_FPS:stamp=0,panel=120,backend=sc,lead_ns=25000000,sc_dst=$GFRC_BUF+gfrc:101"; else echo "这台机器没有 G-FRC+, 跳过第 8 组"; fi ;;
-    11) run 11_hud_static "ip:$IP_MODE:$IP_FPS:$IP_TUNE" "ip:$IP_MODE:$IP_FPS:$IP_TUNE,static=${STATIC:-8}" ;;
+    11) run 11_hud_static "ip:$IP_MODE:$IP_FPS:$IP_TUNE" "ip:$IP_MODE:$IP_FPS:$IP_TUNE,static=${STATIC:-32}" ;;
     10) run 10_interp_cost "ip:real:$IP_FPS:$IP_TUNE" "ip:$IP_MODE:$IP_FPS:$IP_TUNE" ;;
     9) if [ "$HAS_GFRC" = true ]; then run 9_gfrc111_vs_srip gfrc:111 "srip:1:$SR_FULL:$IP_MODE:$IP_FPS:stamp=0,panel=120,backend=sc,lead_ns=25000000+gfrc:101"; else echo "这台机器没有 G-FRC+, 跳过第 9 组"; fi ;;
   esac
