@@ -314,12 +314,14 @@ bool sc_ready(VkDevice dev) {
         return false;
     }
     if (!D->sc) {
-        // debug.knobs.interp_sc_name=<前缀>: 图层名 = 前缀 + "selfsr_interp" (测量脚本按后缀找它)。
+        // debug.knobs.interp_sc_name=<前缀>|auto|none: 图层名 = 前缀 + "selfsr_interp" (测量脚本按后缀找它)。
         // 红魔 SF 的 waitframe 每帧等「游戏图层」的下一帧 (sc_noreal 时游戏图层不再更新, 每帧白等半个 vsync);
         // 试把子图层起成游戏 SurfaceView 的名字, 看它认不认
         char nm[PROP_VALUE_MAX] = {0};
         __system_property_get("debug.knobs.interp_sc_name", nm);
-        std::string pre = nm;
+        // 缺省 auto (2026-10-28 正式结果: 红魔原神 89.8 → 118.8, 别的机器上名字无所谓); none = 旧名 selfsr_interp
+        std::string pre = nm[0] ? nm : "auto";
+        if (pre == "none") pre.clear();
         if (pre == "auto") {   // 游戏 SurfaceView 的名字是「SurfaceView[包名/Activity](BLAST)」: 取进程名拼前缀
             char cmd[256] = {0};
             FILE* f = fopen("/proc/self/cmdline", "r");

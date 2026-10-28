@@ -12,10 +12,11 @@
 #   8. layer+gfrc:101 vs ip:...+gfrc:101             插帧走子图层 (G-FRC+ 101 放开限帧到 60, 子图层插到 ~90), 第 4 步, 只在有 G-FRC+ 的机器上跑
 #   9. gfrc:111 vs srip:1:$SR_FULL:...+gfrc:101       自研超分 + 插帧 vs G-FRC+ 超分 + 插帧, 第 5 步, 同上
 #  11. ip:$IP_MODE vs 同上 + static=$STATIC           静止保护 (HUD 不被拖出重影, 不用标框); 配 PAN=1 量转视角时的 HUD 重影
+#  12. ip (waitframe 开, 子图层旧名) vs 同上 + sc_name=auto   不 root 绕开红魔 waitframe: 子图层起游戏图层的名字, 只在带 waitframe 的机器上跑
 #  10. ip:real vs ip:$IP_MODE (同一套参数)            插帧合成本身的代价: 两臂都 120 Hz、都走子图层, 对照臂只送真实帧不合成 (拆功耗用)
 # 环境变量: PAN (1 = 窗口后录屏转视角量 HUD 重影) STATIC (第 11 组阈值, 0..255 色阶, 缺省 32; 层本身不设属性时也默认 32, 对比臂没写 static 的一律显式关) POWER (1 = 窗口内停充采整机功耗, 高通机) WINDOW (测量窗口秒数, 缺省 10; 量功耗建议 30) ENTER_SCRIPT (onboard 认不出时的进门脚本) KEEP_LAYER_PROP (1 = 全程保留层属性)
 #           SR_SHARP (满分辨率超分锐化, 缺省 1.0; Megacity 0) SR_FULL (本机屏幕:SR_SHARP) SR_SCALE (0.56) SR_OUT (2141x969:0.8) IP_MODE (bm) IP_FPS (120) GFRC_BUF (G-FRC+ 放大后的缓冲, 缺省 3214x1456)
-#           IP_TUNE (stamp=0,panel=120,backend=sc,lead_ns=25000000; 带 waitframe 的系统另加 ,unlimit=1,sfwait=off) COOL_MAX (42) SETS ("1 2 3 4 5 6 7 8 9")
+#           IP_TUNE (stamp=0,panel=120,backend=sc,lead_ns=25000000; 带 waitframe 的系统另加 ,unlimit=1,sc_name=auto; SFWAIT_OFF=1 时 ,unlimit=1,sfwait=off) COOL_MAX (42) SETS ("1 2 3 4 5 6 7 8 9")
 # 前提: 手机已 root、游戏已装好并登录过 (onboard 能进大世界)。层用 knobs/gray/build/build_layer.sh 现编。
 # 每组结束 (含 Ctrl-C) 都把 Game Mode、G-FRC+ 位、debug.knobs.*、刷新率、风扇、屏幕超时写回并回读核对,
 # 层由 gray-layer session 摘除。超分算子用 Catmull-Rom + RCAS (层缺省)。
@@ -40,7 +41,11 @@ SR_SCALE="${SR_SCALE:-0.56}"; SR_OUT="${SR_OUT:-2141x969:0.8}"
 # 定制 SF 带 waitframe 的系统: 插帧要解开进程内限帧 (unlimit=1) 并关 waitframe (sfwait=off, 收尾写回开), 否则子图层卡在约 89 帧;
 # 插帧组的对照臂也解开限帧, 两臂只差插帧 (STEP4「89 帧的真正原因」)
 HAS_WAITFRAME=$(adb -s "$SERIAL" shell getprop ro.vendor.feature.zte_feature_fps_control_wait_frame | tr -d '\r')
-if [ "$HAS_WAITFRAME" = true ]; then SYS_TUNE=",unlimit=1,sfwait=off"; LAYER_REF="layer:unlimit=1"; else SYS_TUNE=""; LAYER_REF="layer"; fi
+# 2026-10-28 起缺省不关 waitframe, 改为子图层起游戏图层的名字 (sc_name=auto, 不要 root, STEP4「不关 waitframe」); SFWAIT_OFF=1 用旧做法
+if [ "$HAS_WAITFRAME" = true ]; then
+  if [ -n "${SFWAIT_OFF:-}" ]; then SYS_TUNE=",unlimit=1,sfwait=off"; else SYS_TUNE=",unlimit=1,sc_name=auto"; fi
+  LAYER_REF="layer:unlimit=1"
+else SYS_TUNE=""; LAYER_REF="layer"; fi
 IP_MODE="${IP_MODE:-bm}"; IP_FPS="${IP_FPS:-120}"; IP_TUNE="${IP_TUNE:-stamp=0,panel=120,backend=sc,lead_ns=25000000$SYS_TUNE}"   # sc: 插帧走子图层, 绕开应用缓冲队列的限帧 (STEP4)
 GFRC_BUF="${GFRC_BUF:-3214x1456}"
 COOL_MAX="${COOL_MAX:-42}"
@@ -74,6 +79,7 @@ for g in $SETS; do
     7) run 7_sr_interp native "srip:1:$SR_FULL:$IP_MODE:$IP_FPS:$IP_TUNE" ;;
     8) if [ "$HAS_GFRC" = true ]; then run 8_interp_gfrc "layer+gfrc:101" "ip:$IP_MODE:$IP_FPS:stamp=0,panel=120,backend=sc,lead_ns=25000000,sc_dst=$GFRC_BUF+gfrc:101"; else echo "这台机器没有 G-FRC+, 跳过第 8 组"; fi ;;
     11) run 11_hud_static "ip:$IP_MODE:$IP_FPS:$IP_TUNE" "ip:$IP_MODE:$IP_FPS:$IP_TUNE,static=${STATIC:-32}" ;;
+    12) if [ "$HAS_WAITFRAME" = true ]; then run 12_waitframe_name "ip:$IP_MODE:$IP_FPS:stamp=0,panel=120,backend=sc,lead_ns=25000000,unlimit=1" "ip:$IP_MODE:$IP_FPS:stamp=0,panel=120,backend=sc,lead_ns=25000000,unlimit=1,sc_name=auto"; else echo "这台机器没有 waitframe, 跳过第 12 组"; fi ;;
     10) run 10_interp_cost "ip:real:$IP_FPS:$IP_TUNE" "ip:$IP_MODE:$IP_FPS:$IP_TUNE" ;;
     9) if [ "$HAS_GFRC" = true ]; then run 9_gfrc111_vs_srip gfrc:111 "srip:1:$SR_FULL:$IP_MODE:$IP_FPS:stamp=0,panel=120,backend=sc,lead_ns=25000000+gfrc:101"; else echo "这台机器没有 G-FRC+, 跳过第 9 组"; fi ;;
   esac
