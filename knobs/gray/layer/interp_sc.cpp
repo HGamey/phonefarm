@@ -319,7 +319,17 @@ bool sc_ready(VkDevice dev) {
         // 试把子图层起成游戏 SurfaceView 的名字, 看它认不认
         char nm[PROP_VALUE_MAX] = {0};
         __system_property_get("debug.knobs.interp_sc_name", nm);
-        std::string name = std::string(nm) + "selfsr_interp";
+        std::string pre = nm;
+        if (pre == "auto") {   // 游戏 SurfaceView 的名字是「SurfaceView[包名/Activity](BLAST)」: 取进程名拼前缀
+            char cmd[256] = {0};
+            FILE* f = fopen("/proc/self/cmdline", "r");
+            if (f) { fread(cmd, 1, sizeof cmd - 1, f); fclose(f); }
+            std::string pkg = cmd;
+            size_t c = pkg.find(':');   // 子进程名 「包名:xxx」
+            if (c != std::string::npos) pkg.resize(c);
+            pre = pkg.empty() ? "" : "SurfaceView[" + pkg + "/";
+        }
+        std::string name = pre + "selfsr_interp";
         D->sc = g_api.createFromWindow(g_window, name.c_str());
         SC_LOG("子图层名 %s", name.c_str());
         if (!D->sc) { g_reason = "create_surface_control"; return false; }

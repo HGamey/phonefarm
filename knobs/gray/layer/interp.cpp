@@ -178,7 +178,7 @@ long g_lead_ns = -1;       // -1 = 一个刷新周期
 long g_sc_ring = 0;        // 子图层缓冲环张数; 0 = 4*(m+1)
 uint64_t g_sc_last = 0;    // 子图层上一张定的上屏时刻 (ns)
 uint64_t g_sc_skip = 0;    // 积压太多而不插合成帧的次数
-long g_sc_noreal = 0;      // debug.knobs.interp_sc_noreal=1: 见 sc 送显处
+long g_sc_noreal = 0;      // debug.knobs.interp_sc_noreal=1: 游戏的图不送显 (还回去); =2: 晚一帧送 (送的是 GPU 早已画完的上一张)。见 sc 送显处
 bool g_rel_ext = false;    // VK_EXT_swapchain_maintenance1 加上了 (CreateDevice 告知)
 long g_sc_real_wait = 0;  // debug.knobs.interp_sc_real_wait=1: 游戏的真实帧交给它自己的 swapchain 之前, CPU 等 GPU 做完 (见 sc 送显处)
 long g_sc_gap_ns = 0;      // debug.knobs.interp_sc_gap_ns: 相邻两张最小间隔, 0 = 一个周期 + 0.1 ms
@@ -321,7 +321,7 @@ void release_swap_locked(Dev* D, Swap& S) {
 
 // sc_noreal: 把之前扣着的图还给 swapchain (先等层对它的拷贝做完, 游戏才能再往里画)。调用方持 g_m。
 void drain_held_locked(Dev* D, VkSwapchainKHR sc, Swap& S) {
-    if (S.held.empty() || !D->ReleaseSwapchainImagesEXT) return;
+    if (S.held.empty() || g_sc_noreal == 2 || !D->ReleaseSwapchainImagesEXT) return;
     std::vector<uint32_t> idx;
     for (auto& h : S.held) {
         if (D->WaitForFences(D->dev, 1, &h.second, VK_TRUE, 100000000ull) != VK_SUCCESS) g_fb["noreal_fence_timeout"]++;
@@ -482,7 +482,7 @@ bool ip_init_from_props() {
     g_lead_ns = prop_long("debug.knobs.interp_lead_ns", -1, -1, 200000000);
     g_sc_gap_ns = prop_long("debug.knobs.interp_sc_gap_ns", 0, 0, 50000000);
     g_sc_real_wait = prop_long("debug.knobs.interp_sc_real_wait", 0, 0, 1);
-    g_sc_noreal = prop_long("debug.knobs.interp_sc_noreal", 0, 0, 1);
+    g_sc_noreal = prop_long("debug.knobs.interp_sc_noreal", 0, 0, 2);
     g_sc_ring = prop_long("debug.knobs.interp_sc_ring", 0, 0, 64);
     g_mult = prop_long("debug.knobs.interp_mult", 1, 1, kMaxMult);
     g_extra_images = prop_long("debug.knobs.interp_extra_images", g_mult + 1, 1, kMaxMult + 1);
@@ -670,6 +670,23 @@ VkResult ip_on_present(VkQueue q, const VkPresentInfoKHR* pi, PFN_vkQueuePresent
     if (si == D->swaps.end()) return bail("swapchain_unknown");
     Swap& S = si->second;
     drain_held_locked(D, sc, S);
+    if (g_sc_noreal == 2 && !S.held.empty()) {
+        // 晚一帧送: 上一次扣下的图这时 GPU 早画完了, 不带信号量送, SF 拿到的缓冲 fence 已 signal,
+        // 红魔 waitframe 不用在 commit 里等它 (游戏图层被不透明子图层盖着, 晚一帧看不出来)
+        auto held = S.held;
+        S.held.clear();
+        lk.unlock();
+        for (auto& h : held) {
+            if (D->WaitForFences(D->dev, 1, &h.second, VK_TRUE, 100000000ull) != VK_SUCCESS) g_fb["lag_fence_timeout"]++;
+            VkPresentInfoKHR lp{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+            lp.swapchainCount = 1; lp.pSwapchains = &sc; lp.pImageIndices = &h.first;
+            VkResult lr = next(q, &lp);
+            if (lr != VK_SUCCESS && lr != VK_SUBOPTIMAL_KHR) g_fb["lag_present_fail"]++;
+        }
+        lk.lock();
+        si = D->swaps.find(sc);
+        if (si == D->swaps.end()) return bail("swapchain_gone");   // map 结点不动: S 仍指向它
+    }
     // 游戏 present 调用节奏 (滑动平均, 用来定半个周期)
     if (S.prev_call_t) {
         uint64_t dt = t - S.prev_call_t;
@@ -765,7 +782,7 @@ VkResult ip_on_present(VkQueue q, const VkPresentInfoKHR* pi, PFN_vkQueuePresent
         sub.waitSemaphoreCount = pi->waitSemaphoreCount; sub.pWaitSemaphores = pi->pWaitSemaphores; sub.pWaitDstStageMask = stages.data();
         sub.commandBufferCount = 1; sub.pCommandBuffers = &sl.cb;
         // sc_noreal: 游戏的图不送显, 不发 present 用的信号量 (发了没人等, 下次再发就是重复 signal)
-        const bool noreal = g_sc_noreal && D->ReleaseSwapchainImagesEXT;
+        const bool noreal = g_sc_noreal == 2 || (g_sc_noreal == 1 && D->ReleaseSwapchainImagesEXT);
         sub.signalSemaphoreCount = noreal ? 0 : 1; sub.pSignalSemaphores = &S.sems[idxN];
         D->ResetFences(D->dev, 1, &sl.fence);
         if (D->QueueSubmit(q, 1, &sub, sl.fence) != VK_SUCCESS) { g_fb["submit_fail"]++; return bail("sc_submit"); }
