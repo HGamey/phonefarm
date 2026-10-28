@@ -1,5 +1,7 @@
 # phonefarm
 
+> **已合并进 [HGamey/hgamey](https://github.com/HGamey/hgamey)（2026-10-28 起），本仓库只读归档。** 代码与完整历史在 hgamey 的 `phonefarm/` 目录，旧提交号到新提交号的对照见 `history/phonefarm.commit-map`；尚未并入 main 的分支已导入为 hgamey 的 `phonefarm/<原分支名>`（有冲突的为 `archive/phonefarm/<原分支名>`），见 `history/branches.md`。新的提交、问题和部署都在 hgamey 进行。
+
 > 本项目基于 [BH3GEI/phonefarm](https://github.com/BH3GEI/phonefarm) 开源工程协同演化，由 HGamey 组织承载面向多平台渲染能效的专用特性开发。
 
 移动设备自动化与性能评测底座：设备连接（Android adb / OpenHarmony hdc / iOS WebDriverAgent）、受控动作、系统参数与 Vulkan 实验、测量及范围明确的恢复证据。外部 Agent 可通过 [harness-ops](https://github.com/HGamey/harness-ops) 的网页与 CLI/API 组织研究；[game_opt_loop](https://github.com/HGamey/game_opt_loop) 是可选方法客户端。
