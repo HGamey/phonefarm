@@ -1087,7 +1087,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL rk_CreateDevice(
     // 加载器链节已推进, 复制一份 create info 改扩展列表即可 (pNext 链原样共享)。
     VkDeviceCreateInfo ip_ci;
     std::vector<const char*> ip_exts;
-    bool ip_ext_enabled = false, sc_ext_enabled = false;
+    bool ip_ext_enabled = false, sc_ext_enabled = false, rel_ext_enabled = false;
+    VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT rel_feat{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT};
     const VkDeviceCreateInfo* orig_ci = ci;
     if (ip_on()) {
         bool supported = false, already = false;
@@ -1120,25 +1121,35 @@ static VKAPI_ATTR VkResult VKAPI_CALL rk_CreateDevice(
         std::vector<const char*> sc_exts = sc_wanted_device_exts(avail, on);
         bool ahb_on = false;
         for (auto& e : on) if (e == "VK_ANDROID_external_memory_android_hardware_buffer") ahb_on = true;
-        if ((want && !already) || !sc_exts.empty()) {
+        // interp_sc_noreal: 游戏的图不送显、直接还给 swapchain, 要 vkReleaseSwapchainImagesEXT。
+        // 游戏自己开了就照用 (它的 pNext 里会有功能结构); 没开就加扩展并在 pNext 链头挂上功能开关
+        bool rel_have = false, rel_on = false;
+        for (auto& e : avail) if (e == VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME) rel_have = true;
+        for (auto& e : on) if (e == VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME) rel_on = true;
+        const bool rel_add = ip_sc_noreal() && rel_have && !rel_on;
+        rel_ext_enabled = ip_sc_noreal() && (rel_on || rel_add);
+        if ((want && !already) || !sc_exts.empty() || rel_add) {
             ip_exts.assign(ci->ppEnabledExtensionNames, ci->ppEnabledExtensionNames + ci->enabledExtensionCount);
             if (want && !already) ip_exts.push_back(want);
             for (auto* e : sc_exts) { ip_exts.push_back(e); if (!strcmp(e, "VK_ANDROID_external_memory_android_hardware_buffer")) ahb_on = true; }
+            if (rel_add) ip_exts.push_back(VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME);
             ip_ci = *ci;
+            if (rel_add) { rel_feat.swapchainMaintenance1 = VK_TRUE; rel_feat.pNext = (void*)ci->pNext; ip_ci.pNext = &rel_feat; }
             ip_ci.enabledExtensionCount = (uint32_t)ip_exts.size();
             ip_ci.ppEnabledExtensionNames = ip_exts.data();
             ci = &ip_ci;
         }
         ip_ext_enabled = want != nullptr;
         sc_ext_enabled = sc_requested() && ahb_on;
-        RK_LOG("interp: VK_GOOGLE_display_timing supported=%d already=%d enabled=%d; sc 扩展 +%zu ahb=%d", (int)supported,
-               (int)already, (int)ip_ext_enabled, sc_exts.size(), (int)sc_ext_enabled);
+        RK_LOG("interp: VK_GOOGLE_display_timing supported=%d already=%d enabled=%d; sc 扩展 +%zu ahb=%d; noreal 扩展 have=%d on=%d add=%d",
+               (int)supported, (int)already, (int)ip_ext_enabled, sc_exts.size(), (int)sc_ext_enabled, (int)rel_have, (int)rel_on,
+               (int)rel_add);
     }
     VkResult r = createFunc(phys, ci, a, pDev);
     if (r != VK_SUCCESS && ci == &ip_ci) {
         // 重试只在「没有别的层夹在中间」时可靠 (加载器链节已被推进一次); 本机只挂本层
         RK_LOG("interp: 加扩展后 vkCreateDevice 失败 (%d), 退回原参数", (int)r);
-        ip_ext_enabled = false; sc_ext_enabled = false;
+        ip_ext_enabled = false; sc_ext_enabled = false; rel_ext_enabled = false;
         ci = orig_ci;
         r = createFunc(phys, ci, a, pDev);
     }
@@ -1274,7 +1285,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL rk_CreateDevice(
     uint32_t sole_family = ci->queueCreateInfoCount == 1 && ci->pQueueCreateInfos ? ci->pQueueCreateInfos[0].queueFamilyIndex
                                                                                   : UINT32_MAX;
     if (fd_on()) fd_on_device(inst, phys, *pDev, gipa, gdpa, sdld, sole_family);
-    if (ip_on()) ip_on_device(inst, phys, *pDev, gipa, gdpa, sdld, sole_family, ip_ext_enabled);
+    if (ip_on()) { ip_note_release_ext(rel_ext_enabled); ip_on_device(inst, phys, *pDev, gipa, gdpa, sdld, sole_family, ip_ext_enabled); }
     if (ip_on() && sc_requested())
         sc_on_device(*pDev, phys, gdpa, inst && gipa ? (PFN_vkGetPhysicalDeviceMemoryProperties)gipa(inst, "vkGetPhysicalDeviceMemoryProperties") : nullptr,
                      sc_ext_enabled);

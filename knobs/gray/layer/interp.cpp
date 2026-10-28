@@ -119,6 +119,7 @@ struct Swap {
     std::map<uint32_t, Pending> pend;      // 等回读的 presentID → 记录
     std::deque<uint32_t> pend_order;       // 只留最近 512 条
     std::deque<VkPastPresentationTimingGOOGLE> game_q;   // 游戏编号的回读记录, 等游戏自己来取
+    std::vector<std::pair<uint32_t, VkFence>> held;      // sc_noreal: 没送显的图, 层的拷贝做完 (fence) 后还给 swapchain
     uint64_t last_seq = 0; uint8_t last_kind = K_REAL; uint64_t last_actual = 0;
     // 游戏 present 调用节奏
     uint64_t prev_call_t = 0; double ema_ns = 0;
@@ -150,7 +151,7 @@ struct Dev {
     IP_FN(CreateImage) IP_FN(DestroyImage) IP_FN(GetImageMemoryRequirements) IP_FN(AllocateMemory) IP_FN(FreeMemory)
     IP_FN(BindImageMemory) IP_FN(GetRefreshCycleDurationGOOGLE) IP_FN(GetPastPresentationTimingGOOGLE)
     IP_FN(GetPhysicalDeviceMemoryProperties) IP_FN(GetPhysicalDeviceSurfaceCapabilitiesKHR)
-    IP_FN(GetPhysicalDeviceFormatProperties)
+    IP_FN(GetPhysicalDeviceFormatProperties) IP_FN(ReleaseSwapchainImagesEXT)
 #undef IP_FN
     std::map<VkSwapchainKHR, Swap> swaps;
     std::vector<VkSemaphore> retired_sems;
@@ -177,6 +178,8 @@ long g_lead_ns = -1;       // -1 = 一个刷新周期
 long g_sc_ring = 0;        // 子图层缓冲环张数; 0 = 4*(m+1)
 uint64_t g_sc_last = 0;    // 子图层上一张定的上屏时刻 (ns)
 uint64_t g_sc_skip = 0;    // 积压太多而不插合成帧的次数
+long g_sc_noreal = 0;      // debug.knobs.interp_sc_noreal=1: 见 sc 送显处
+bool g_rel_ext = false;    // VK_EXT_swapchain_maintenance1 加上了 (CreateDevice 告知)
 long g_sc_real_wait = 0;  // debug.knobs.interp_sc_real_wait=1: 游戏的真实帧交给它自己的 swapchain 之前, CPU 等 GPU 做完 (见 sc 送显处)
 long g_sc_gap_ns = 0;      // debug.knobs.interp_sc_gap_ns: 相邻两张最小间隔, 0 = 一个周期 + 0.1 ms
 long g_extra_images = 2;
@@ -313,6 +316,21 @@ void release_swap_locked(Dev* D, Swap& S) {
     if (S.hist_mem) { D->FreeMemory(D->dev, S.hist_mem, nullptr); S.hist_mem = VK_NULL_HANDLE; }
     for (auto s : S.sems) if (s) D->retired_sems.push_back(s);
     S.sems.clear();
+    S.held.clear();   // swapchain 要销毁了, 扣着的图随它一起走
+}
+
+// sc_noreal: 把之前扣着的图还给 swapchain (先等层对它的拷贝做完, 游戏才能再往里画)。调用方持 g_m。
+void drain_held_locked(Dev* D, VkSwapchainKHR sc, Swap& S) {
+    if (S.held.empty() || !D->ReleaseSwapchainImagesEXT) return;
+    std::vector<uint32_t> idx;
+    for (auto& h : S.held) {
+        if (D->WaitForFences(D->dev, 1, &h.second, VK_TRUE, 100000000ull) != VK_SUCCESS) g_fb["noreal_fence_timeout"]++;
+        idx.push_back(h.first);
+    }
+    VkReleaseSwapchainImagesInfoEXT ri{VK_STRUCTURE_TYPE_RELEASE_SWAPCHAIN_IMAGES_INFO_EXT};
+    ri.swapchain = sc; ri.imageIndexCount = (uint32_t)idx.size(); ri.pImageIndices = idx.data();
+    if (D->ReleaseSwapchainImagesEXT(D->dev, &ri) != VK_SUCCESS) g_fb["noreal_release_fail"]++;
+    S.held.clear();
 }
 
 void image_barrier(Dev* D, VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout to, VkAccessFlags sa,
@@ -448,6 +466,9 @@ void ip_register_synth(const char* mode, IpSynthFn fn, void* user) {
     registry()[mode] = Synth{fn, user};
 }
 
+bool ip_sc_noreal() { return g_on && g_sc_noreal && sc_requested(); }
+void ip_note_release_ext(bool on) { std::lock_guard<std::mutex> lk(g_m); g_rel_ext = on; }
+
 bool ip_init_from_props() {
     std::string v = prop("debug.knobs.interp");
     g_on = !v.empty() && (v[0] == '1' || v[0] == 't' || v[0] == 'y');
@@ -461,6 +482,7 @@ bool ip_init_from_props() {
     g_lead_ns = prop_long("debug.knobs.interp_lead_ns", -1, -1, 200000000);
     g_sc_gap_ns = prop_long("debug.knobs.interp_sc_gap_ns", 0, 0, 50000000);
     g_sc_real_wait = prop_long("debug.knobs.interp_sc_real_wait", 0, 0, 1);
+    g_sc_noreal = prop_long("debug.knobs.interp_sc_noreal", 0, 0, 1);
     g_sc_ring = prop_long("debug.knobs.interp_sc_ring", 0, 0, 64);
     g_mult = prop_long("debug.knobs.interp_mult", 1, 1, kMaxMult);
     g_extra_images = prop_long("debug.knobs.interp_extra_images", g_mult + 1, 1, kMaxMult + 1);
@@ -521,6 +543,7 @@ void ip_on_device(VkInstance inst, VkPhysicalDevice phys, VkDevice dev, PFN_vkGe
     IP_GD(CreateImage) IP_GD(DestroyImage) IP_GD(GetImageMemoryRequirements) IP_GD(AllocateMemory) IP_GD(FreeMemory)
     IP_GD(BindImageMemory)
     if (ext_enabled) { IP_GD(GetRefreshCycleDurationGOOGLE) IP_GD(GetPastPresentationTimingGOOGLE) }
+    if (g_rel_ext) IP_GD(ReleaseSwapchainImagesEXT)
 #undef IP_GD
     if (inst && gipa) {
         D->GetPhysicalDeviceMemoryProperties = (PFN_vkGetPhysicalDeviceMemoryProperties)gipa(inst, "vkGetPhysicalDeviceMemoryProperties");
@@ -538,7 +561,8 @@ void ip_on_device(VkInstance inst, VkPhysicalDevice phys, VkDevice dev, PFN_vkGe
         g_pacing_reason = "ext_functions_missing";
     if (g_pacing && !ext_enabled && g_pacing_reason.empty()) g_pacing_reason = "ext_not_enabled";
     g_devs[fkey(dev)] = D;
-    IP_LOG("device 已登记: complete=%d display_timing=%d loader_data_callback=%d", (int)D->complete, (int)ext_enabled, sdld ? 1 : 0);
+    IP_LOG("device 已登记: complete=%d display_timing=%d loader_data_callback=%d sc_noreal=%ld release=%d", (int)D->complete,
+           (int)ext_enabled, sdld ? 1 : 0, g_sc_noreal, D->ReleaseSwapchainImagesEXT ? 1 : 0);
 }
 
 void ip_on_destroy_device(VkDevice dev) {
@@ -645,6 +669,7 @@ VkResult ip_on_present(VkQueue q, const VkPresentInfoKHR* pi, PFN_vkQueuePresent
     auto si = D->swaps.find(sc);
     if (si == D->swaps.end()) return bail("swapchain_unknown");
     Swap& S = si->second;
+    drain_held_locked(D, sc, S);
     // 游戏 present 调用节奏 (滑动平均, 用来定半个周期)
     if (S.prev_call_t) {
         uint64_t dt = t - S.prev_call_t;
@@ -739,7 +764,9 @@ VkResult ip_on_present(VkQueue q, const VkPresentInfoKHR* pi, PFN_vkQueuePresent
         VkSubmitInfo sub{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         sub.waitSemaphoreCount = pi->waitSemaphoreCount; sub.pWaitSemaphores = pi->pWaitSemaphores; sub.pWaitDstStageMask = stages.data();
         sub.commandBufferCount = 1; sub.pCommandBuffers = &sl.cb;
-        sub.signalSemaphoreCount = 1; sub.pSignalSemaphores = &S.sems[idxN];
+        // sc_noreal: 游戏的图不送显, 不发 present 用的信号量 (发了没人等, 下次再发就是重复 signal)
+        const bool noreal = g_sc_noreal && D->ReleaseSwapchainImagesEXT;
+        sub.signalSemaphoreCount = noreal ? 0 : 1; sub.pSignalSemaphores = &S.sems[idxN];
         D->ResetFences(D->dev, 1, &sl.fence);
         if (D->QueueSubmit(q, 1, &sub, sl.fence) != VK_SUCCESS) { g_fb["submit_fail"]++; return bail("sc_submit"); }
         S.hist_valid = use_hist;
@@ -800,6 +827,16 @@ VkResult ip_on_present(VkQueue q, const VkPresentInfoKHR* pi, PFN_vkQueuePresent
         }
         g_cpu_us.push((now_ns() - t) / 1000);
         VkSemaphore semN = S.sems[idxN];
+        // sc_noreal: 真实帧已经拷进子图层, 游戏自己的 swapchain 不送显, 图扣到下一次 present 时还回去 (不进 SF)。
+        // 游戏图层从此没有新缓冲, 红魔 SF 的 waitframe 就没有「fence 还没 signal 的游戏缓冲」可等,
+        // 不会再因为等它整帧跳过 (见上: 这是子图层卡 89 帧的原因)。不需要 root, 不改系统设置
+        if (noreal) {
+            S.held.push_back({idxN, sl.fence});
+            g_fb["noreal_withheld"]++;
+            lk.unlock();
+            sc_show(D->dev, show, S.w, S.h, S.pre, fence_fd);
+            return VK_SUCCESS;
+        }
         lk.unlock();
         sc_show(D->dev, show, S.w, S.h, S.pre, fence_fd);
         VkPresentInfoKHR pn = *pi;
